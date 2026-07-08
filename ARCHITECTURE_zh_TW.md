@@ -29,23 +29,23 @@ Optico/
 
 ```mermaid
 graph TD
-    A[連拍影像目錄] --> B[load_burst_images (Phase 1)]
-    B --> C[粗 ECC 對齊 (Phase 2)]
-    C --> D[和諧定錨點選擇參考幀 (Phase 3)]
+    A["連拍影像目錄"] --> B["load_burst_images<br/>Phase 1"]
+    B --> C["粗 ECC 對齐<br/>Phase 2"]
+    C --> D["和諧定錨點選擇參考幀<br/>Phase 3"]
     D --> E{參考幀是否為 0?}
-    E -- 否 --> F[精準 ECC 對齊 (Phase 4)]
-    E -- 是 --> G[計算抖動品質 Phase 5 與動態運動遮罩 Phase 6]
+    E -->|否| F["精準 ECC 對齐<br/>Phase 4"]
+    E -->|是| G["計算抖動品質 Phase 5<br/>與動態運動遮罩 Phase 6"]
     F --> G
-    G --> H[Pre-flight 安全倍率計算 (Phase 7)]
-    H --> I[記憶體分塊 Drizzle 疊加 (Phase 8)]
-    I --> J[自適應雙頻 Wiener 反捲積 (Phase 9)]
-    J --> K[輸出最終超解析影像 (Phase 10)]
+    G --> H["Pre-flight 安全倍率計算<br/>Phase 7"]
+    H --> I["記憶體分塊 Drizzle 疊加<br/>Phase 8"]
+    I --> J["自適應雙頻 Wiener 反捲積<br/>Phase 9"]
+    J --> K["輸出最終超解析影像<br/>Phase 10"]
 ```
 
 ### 1. 配准與定錨 (`alignment.py`)
 為了解決傳統對齊盲目綁定第一幀所產生的偏斜問題，Optico 採用了粗對齊到精定錨的策略：
 * **初始對齊**：先以第一幀為基準，透過 OpenCV 的 Enhanced Correlation Coefficient (ECC) 進行亞像素對齊，限制為 `MOTION_TRANSLATION` 模式以防止對雜訊過擬合。
-* **和諧定錨 (Harmony Anchor)**：利用 **Weiszfeld 演算法** 尋找所有位移向量的 **幾何中位數 (Geometric Median)** 做為光學重心。接著在重心附近的候選幀中，選擇 Laplacian 變異數最大（最清晰）的幀做為最終對齊參考幀。
+* **和諧定錨 (Harmony Anchor)**：利用 **Weiszfeld 演算法** 尋找所有位移向量的 **幾何中位數 (Geometric Median)** 做為光學重心。接著在重心附近的候選幀中，選擇最清晰者（Laplacian 最高）作為參考幀。
 * **精準配准**：若參考幀非第一幀，則將整組連拍重新精準配准至此參考幀。
 * **2D 圓統計 (Phase 5)**：將位移向量的小數部分映射至單位環，計算 2D 聯合向量長度 $R_{2D} = \sqrt{R_x \cdot R_y}$，用以評估亞像素手震抖動分佈的均勻性。
 
@@ -63,9 +63,9 @@ graph TD
 
 ### 4. Drizzle 疊加 (`drizzle.py`)
 * **向量化投影**：利用 `cv2.warpAffine` 將每幀影像與遮罩同步投影至 HR 畫布，時間複雜度為優異的 $O(N \cdot H \cdot W)$。
-* **記憶體條帶分塊 (Chunking)**：將超解析畫布水平分割。每個分塊完成累加並除以權重後，強制刪除中間高精度矩陣並呼叫 `gc.collect()` 釋放，使峰值記憶體牢牢鎖定在 3GB 以內。
+* **記憶體條帶分塊 (Chunking)**：將超解析畫布水平分割。每個分塊完成累加並除以權重後，強制刪除中間高精度矩陣並呼叫 `gc.collect()` 釋放，使峰值記憶體受控。
 
 ### 5. 自適應反捲積 (`deconvolution.py`)
-* **動態底噪估計**：在空間域以修正後的 Laplacian MAD 公式 $1.4826 \cdot \text{median}(|\text{Lap}(I) - \text{median}(\text{Lap}(I))|)$ 算出 Drizzle 後的真實物理噪聲標準差 $\sigma_{noise}$。
+* **動態底噪估計**：在空間域以修正後的 Laplacian MAD 公式 $1.4826 \cdot \text{median}(|\text{Lap}(I) - \text{median}(\text{Lap}(I))|)$ 算出 Drizzle 後的真實物理噪聲標準差。
 * **雙頻 Wiener**：在頻域根據 $\sigma_{noise}$ 動態調整正則化參數，生成平坦區重火力（$K_{strong}$）與邊緣區輕火力（$K_{weak}$）兩個重建頻域。
 * **邊緣感知混合**：利用空間域的 Canny 軟性遮罩進行空間混合，在保留細節的同時消除邊緣 Ringing 白邊。
