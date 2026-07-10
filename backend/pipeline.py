@@ -11,6 +11,22 @@ Orchestrates the full MFSR processing chain:
   Phase 8 : Drizzle multi-frame stacking
   Phase 9 : Adaptive Wiener deconvolution
   Phase 10: Final output
+
+Drizzle Cache
+-------------
+Phases 2-8 are expensive and deterministic — for a fixed burst set and
+configuration they always produce the same hr_image. To speed up
+repeated deconvolution experiments, the Phase 8 output is cached on
+disk (see backend/cache.py). On subsequent runs with the same input
+directory and identical Drizzle-affecting config, Phases 2-8 are
+skipped entirely and execution resumes from Phase 9.
+
+Cache is keyed on the SHA-256 of each input file's content plus the
+relevant OpticoConfig fields (psf_override and skip_deconv are
+excluded so deconv tweaks always hit the cache).
+
+Use --no-cache to force a full reprocess even if a cache entry exists.
+Use --cache-dir to specify a custom cache location (default: ~/.optico_cache).
 """
 import argparse
 import logging
@@ -33,11 +49,17 @@ from .masking import calculate_dynamic_mask, calculate_retained_ratio
 from .preflight import resolve_final_scale
 from .drizzle import drizzle_stack
 from .deconvolution import deconvolve_color
+from .cache import (
+    DEFAULT_CACHE_DIR,
+    compute_cache_key,
+    load_drizzle_cache,
+    save_drizzle_cache,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def load_burst_images(input_dir: str) -> list[np.ndarray]:
+def load_burst_images(input_dir: str) -> tuple[list[np.ndarray], list[Path]]:
     """Load burst images from a directory.
 
     Supports JPEG, PNG, TIFF. Images are sorted alphabetically.
@@ -50,8 +72,8 @@ def load_burst_images(input_dir: str) -> list[np.ndarray]:
 
     Returns
     -------
-    list of np.ndarray
-        Loaded images (BGR, uint8).
+    tuple[list[np.ndarray], list[Path]]
+        Loaded images (BGR, uint8) and their corresponding file paths.
 
     Raises
     ------
@@ -80,6 +102,7 @@ def load_burst_images(input_dir: str) -> list[np.ndarray]:
         )
 
     images: list[np.ndarray] = []
+    loaded_paths: list[Path] = []
     ref_shape = None
     for f in image_files:
         img = cv2.imread(str(f), cv2.IMREAD_COLOR)
@@ -94,6 +117,7 @@ def load_burst_images(input_dir: str) -> list[np.ndarray]:
                 f"expected {ref_shape}"
             )
         images.append(img)
+        loaded_paths.append(f)
 
     if not images:
         raise FileNotFoundError(
@@ -104,13 +128,16 @@ def load_burst_images(input_dir: str) -> list[np.ndarray]:
         "Loaded %d images (%dx%d) from %s",
         len(images), ref_shape[1], ref_shape[0], input_dir,
     )
-    return images
+    return images, loaded_paths
 
 
 def run_pipeline(
     images: list[np.ndarray],
     config: Optional[OpticoConfig] = None,
     output_path: Optional[str] = None,
+    image_paths: Optional[list[Path]] = None,
+    use_cache: bool = True,
+    cache_dir: Path = DEFAULT_CACHE_DIR,
 ) -> np.ndarray:
     """Run the complete Optico MFSR pipeline.
 
@@ -122,6 +149,13 @@ def run_pipeline(
         Pipeline configuration. Uses defaults if None.
     output_path : str, optional
         If provided, saves the result to this path.
+    image_paths : list[Path], optional
+        File paths corresponding to `images`. Required for cache lookup.
+        If None, cache is disabled for this run.
+    use_cache : bool
+        If False, skip cache lookup and always recompute Phases 2-8.
+    cache_dir : Path
+        Root directory for the on-disk Drizzle cache.
 
     Returns
     -------
@@ -146,71 +180,117 @@ def run_pipeline(
     )
     logger.info("=" * 60)
 
-    # -- Phase 2: Coarse Alignment --
-    # Find the sharpest frame first as the initial coarse reference to avoid aligning to a blurry or shaken Frame 0
-    logger.info("Selecting initial coarse reference frame based on sharpness...")
-    sharpness_scores = []
-    for img in images:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        sharpness_scores.append(float(cv2.Laplacian(gray, cv2.CV_64F).var()))
-    coarse_ref_idx = int(np.argmax(sharpness_scores))
-    logger.info(
-        "  Coarse reference: frame %d (sharpness=%.1f)",
-        coarse_ref_idx, sharpness_scores[coarse_ref_idx],
-    )
+    # ------------------------------------------------------------------ #
+    # Drizzle Cache Lookup (Phases 2-8)                                   #
+    # ------------------------------------------------------------------ #
+    drizzle_result = None
+    cache_key = None
 
-    logger.info("-- Phase 2: Coarse ECC Alignment --")
-    M_list_initial, cc_list = align_images_ecc(
-        images, ref_idx=coarse_ref_idx, config=config
-    )
+    if use_cache and image_paths is not None:
+        logger.info("-- Cache: Computing cache key (hashing input files)... --")
+        cache_key = compute_cache_key(image_paths, config)
+        logger.info("  Cache key: %s...", cache_key[:16])
+        drizzle_result = load_drizzle_cache(cache_key, cache_dir=cache_dir)
 
-    # -- Phase 3: Reference Frame Selection (Harmony Anchor) --
-    logger.info("-- Phase 3: Harmony Anchor Selection --")
-    ref_idx = select_reference_frame(images, M_list_initial)
-
-    # -- Phase 4: Refined Alignment (re-align to the selected reference) --
-    if ref_idx != coarse_ref_idx:
-        logger.info("-- Phase 4: Refined ECC Alignment --")
-        M_list, cc_list = align_images_ecc(
-            images, ref_idx=ref_idx, config=config
+    if drizzle_result is not None:
+        # ---- Cache HIT: skip Phases 2-8 ---- #
+        hr_image = drizzle_result["hr_image"]
+        final_scale = drizzle_result["final_scale"]
+        retained_ratio = drizzle_result["retained_ratio"]
+        dither_quality = drizzle_result["dither_quality"]
+        safe_cap = drizzle_result["safe_cap"]
+        logger.info(
+            "-- Phases 2-8: SKIPPED (cache hit) | "
+            "scale=%.2f retained=%.3f dither=%.3f --",
+            final_scale, retained_ratio, dither_quality,
         )
     else:
-        logger.info("-- Phase 4: Skipping Re-alignment (Coarse reference is optimal) --")
-        M_list = M_list_initial
+        # ---- Cache MISS: run full Phases 2-8 ---- #
+        if use_cache and image_paths is not None:
+            logger.info("-- Cache: MISS — running full pipeline --")
+        else:
+            logger.info("-- Cache: disabled for this run --")
 
-    # -- Phase 5: Dither Quality Assessment --
-    logger.info("-- Phase 5: Dither Quality Assessment --")
-    dither_q = calculate_dither_quality_2d(M_list)
-    logger.info("  Dither quality (2D circular stats): %.3f", dither_q)
+        # -- Phase 2: Coarse Alignment --
+        logger.info("Selecting initial coarse reference frame based on sharpness...")
+        sharpness_scores = []
+        for img in images:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            sharpness_scores.append(float(cv2.Laplacian(gray, cv2.CV_64F).var()))
+        coarse_ref_idx = int(np.argmax(sharpness_scores))
+        logger.info(
+            "  Coarse reference: frame %d (sharpness=%.1f)",
+            coarse_ref_idx, sharpness_scores[coarse_ref_idx],
+        )
 
-    # -- Phase 6: Dynamic Foreground Masking --
-    logger.info("-- Phase 6: Dynamic Foreground Masking --")
-    weight_maps = calculate_dynamic_mask(
-        images, M_list, ref_idx=ref_idx, config=config
-    )
+        logger.info("-- Phase 2: Coarse ECC Alignment --")
+        M_list_initial, cc_list = align_images_ecc(
+            images, ref_idx=coarse_ref_idx, config=config
+        )
 
-    # -- Phase 7: Pre-flight Scale Bounding --
-    logger.info("-- Phase 7: Pre-flight Scale Bounding --")
-    retained_ratio = calculate_retained_ratio(weight_maps)
-    valid_count = sum(1 for m in M_list if m is not None)
+        # -- Phase 3: Reference Frame Selection (Harmony Anchor) --
+        logger.info("-- Phase 3: Harmony Anchor Selection --")
+        ref_idx = select_reference_frame(images, M_list_initial)
 
-    final_scale, safe_cap = resolve_final_scale(
-        target_scale=config.target_scale,
-        num_frames=valid_count,
-        retained_ratio=retained_ratio,
-        dither_quality=dither_q,
-        cc_scores=cc_list,
-        config=config,
-    )
+        # -- Phase 4: Refined Alignment --
+        if ref_idx != coarse_ref_idx:
+            logger.info("-- Phase 4: Refined ECC Alignment --")
+            M_list, cc_list = align_images_ecc(
+                images, ref_idx=ref_idx, config=config
+            )
+        else:
+            logger.info("-- Phase 4: Skipping Re-alignment (Coarse reference is optimal) --")
+            M_list = M_list_initial
 
-    # -- Phase 8: Drizzle Stacking --
-    logger.info("-- Phase 8: Drizzle Stacking --")
-    hr_image = drizzle_stack(
-        images, M_list, weight_maps,
-        scale=final_scale, ref_idx=ref_idx, config=config,
-    )
+        # -- Phase 5: Dither Quality Assessment --
+        logger.info("-- Phase 5: Dither Quality Assessment --")
+        dither_quality = calculate_dither_quality_2d(M_list)
+        logger.info("  Dither quality (2D circular stats): %.3f", dither_quality)
 
-    # -- Phase 9: Adaptive Wiener Deconvolution --
+        # -- Phase 6: Dynamic Foreground Masking --
+        logger.info("-- Phase 6: Dynamic Foreground Masking --")
+        weight_maps = calculate_dynamic_mask(
+            images, M_list, ref_idx=ref_idx, config=config
+        )
+
+        # -- Phase 7: Pre-flight Scale Bounding --
+        logger.info("-- Phase 7: Pre-flight Scale Bounding --")
+        retained_ratio = calculate_retained_ratio(weight_maps)
+        valid_count = sum(1 for m in M_list if m is not None)
+
+        final_scale, safe_cap = resolve_final_scale(
+            target_scale=config.target_scale,
+            num_frames=valid_count,
+            retained_ratio=retained_ratio,
+            dither_quality=dither_quality,
+            cc_scores=cc_list,
+            config=config,
+        )
+
+        # -- Phase 8: Drizzle Stacking --
+        logger.info("-- Phase 8: Drizzle Stacking --")
+        hr_image = drizzle_stack(
+            images, M_list, weight_maps,
+            scale=final_scale, ref_idx=ref_idx, config=config,
+        )
+
+        # -- Save to cache --
+        if use_cache and cache_key is not None and image_paths is not None:
+            save_drizzle_cache(
+                cache_key=cache_key,
+                hr_image=hr_image,
+                final_scale=final_scale,
+                retained_ratio=retained_ratio,
+                dither_quality=dither_quality,
+                safe_cap=safe_cap,
+                image_paths=image_paths,
+                config=config,
+                cache_dir=cache_dir,
+            )
+
+    # ------------------------------------------------------------------ #
+    # Phase 9: Adaptive Wiener Deconvolution                              #
+    # ------------------------------------------------------------------ #
     if not config.skip_deconv:
         logger.info("-- Phase 9: Adaptive Wiener Deconvolution --")
         hr_image = deconvolve_color(
@@ -237,7 +317,7 @@ def run_pipeline(
         "  Safe cap: %.2f | Retained ratio: %.3f",
         safe_cap, retained_ratio,
     )
-    logger.info("  Dither quality: %.3f", dither_q)
+    logger.info("  Dither quality: %.3f", dither_quality)
     logger.info("  Total time: %.1fs", elapsed)
     logger.info("=" * 60)
 
@@ -259,6 +339,8 @@ def main() -> None:
             "  python -m backend.pipeline --input ./burst --output result.png\n"
             "  python -m backend.pipeline --input ./burst --scale 2.5\n"
             "  python -m backend.pipeline --input ./burst --no-deconv\n"
+            "  python -m backend.pipeline --input ./burst --no-cache\n"
+            "  python -m backend.pipeline --input ./burst --cache-dir /tmp/optico_cache\n"
         ),
     )
     parser.add_argument(
@@ -290,6 +372,17 @@ def main() -> None:
         help="Downscale factor for ECC alignment (default: 0.5)",
     )
     parser.add_argument(
+        "--no-cache", action="store_true",
+        help="Disable Drizzle cache; always recompute Phases 2-8",
+    )
+    parser.add_argument(
+        "--cache-dir", type=str, default=None,
+        help=(
+            f"Cache directory (default: {DEFAULT_CACHE_DIR}). "
+            "Stores Drizzle results for fast deconvolution re-runs."
+        ),
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true",
         help="Enable debug logging",
     )
@@ -312,9 +405,18 @@ def main() -> None:
         align_scale=args.align_scale,
     )
 
+    cache_dir = Path(args.cache_dir) if args.cache_dir else DEFAULT_CACHE_DIR
+
     try:
-        images = load_burst_images(args.input)
-        run_pipeline(images, config=config, output_path=args.output)
+        images, image_paths = load_burst_images(args.input)
+        run_pipeline(
+            images,
+            config=config,
+            output_path=args.output,
+            image_paths=image_paths,
+            use_cache=not args.no_cache,
+            cache_dir=cache_dir,
+        )
     except (FileNotFoundError, ValueError) as e:
         logger.error(str(e))
         sys.exit(1)
