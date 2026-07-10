@@ -85,29 +85,57 @@ DRIZZLE_WEIGHT_FLOOR: float = 1e-6
 """Minimum weight to avoid division by zero in Drizzle normalization."""
 
 # ============================================================
-# Wiener Deconvolution (Phase 5)
+# Wiener Deconvolution (Phase 9)
 # ============================================================
 MAD_SCALE_FACTOR: float = 1.4826
 """Scale factor converting MAD to standard deviation for Gaussian noise.
 Equals 1 / Phi_inv(3/4) where Phi is the standard normal CDF."""
 
 K_EST_MIN: float = 0.001
-"""Minimum Wiener regularization parameter."""
+"""Retained for backward compatibility / diagnostic logging only.
+No longer used to derive the Wiener regularization parameter directly—
+see NOISE_FLOOR_HIGH_FREQ_FRACTION below."""
 
 K_EST_MAX: float = 0.08
-"""Maximum Wiener regularization parameter."""
+"""Retained for backward compatibility / diagnostic logging only."""
 
-K_STRONG_MULTIPLIER: float = 2.0
-"""Multiplier for flat-region (aggressive) regularization."""
+NOISE_FLOOR_HIGH_FREQ_FRACTION: float = 0.75
+"""Lower bound of the radial frequency search range (as a fraction of the
+Nyquist radius) used by _find_noise_plateau() to locate the frequency
+annulus where the image power spectrum has decayed to its white-noise
+floor. The actual cutoff is found adaptively; this is the minimum
+frequency considered, not a fixed boundary.
+Chosen so the search starts well into the noise-dominated region for
+typical camera images while leaving headroom for high-resolution
+Drizzle outputs where signal may extend slightly further."""
 
-K_WEAK_MULTIPLIER: float = 6.0
-"""Multiplier for edge-region (conservative) regularization."""
+NOISE_PLATEAU_BINS: int = 20
+"""Number of radial frequency bins used by _find_noise_plateau() to
+search for the onset of the noise plateau. More bins = finer resolution
+but slower; 20 is a good balance for images up to ~8k px."""
 
-K_STRONG_FLOOR: float = 0.01
-"""Minimum K for flat regions."""
+NOISE_PLATEAU_GRAD_THRESHOLD: float = 0.05
+"""Relative gradient threshold for plateau detection: a bin is considered
+part of the flat noise floor when its change in median power is less than
+this fraction of the DC-region power. Lower = finds plateau earlier
+(more aggressive noise suppression); higher = more conservative."""
 
-K_WEAK_FLOOR: float = 0.03
-"""Minimum K for edge regions."""
+MIN_SIGNAL_POWER_FRACTION: float = 0.005
+"""Floor on estimated per-frequency signal power, as a fraction of the
+noise floor, to avoid division-by-zero / unbounded K at frequencies
+where measured power dips below the noise floor (pure noise bins)."""
+
+K_FREQ_MIN: float = 1e-4
+"""Lower clip bound for the per-frequency regularization K(f).
+Prevents Wiener filter from acting as a pure inverse filter at any
+frequency, which would amplify noise catastrophically."""
+
+K_FREQ_MAX: float = 200.0
+"""Upper clip bound for the per-frequency regularization K(f).
+At K=200 the Wiener response is 1/(1+200) ≈ 0.5%, effectively
+suppressing those frequencies to near-zero. Generous rather than tight
+because DC-gain preservation (not K clamping) is the operative
+brightness-safety mechanism."""
 
 PSF_SIGMA_MIN: float = 0.6
 """Minimum PSF sigma (tightest optical limit)."""
@@ -117,15 +145,6 @@ PSF_SIGMA_SCALE: float = 0.4
 
 PSF_TRUNCATION_SIGMAS: float = 3.0
 """Number of sigmas to include in the truncated PSF kernel."""
-
-EDGE_CANNY_LOW: int = 50
-"""Canny edge detector low threshold for dual-band blending mask."""
-
-EDGE_CANNY_HIGH: int = 150
-"""Canny edge detector high threshold for dual-band blending mask."""
-
-EDGE_MASK_BLUR_KSIZE: int = 7
-"""Gaussian blur kernel size for edge mask smoothing in dual-band blend."""
 
 
 @dataclass
