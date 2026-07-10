@@ -40,6 +40,15 @@ excluded so deconv tweaks always hit the cache).
 
 Use --no-cache to force a full reprocess even if a cache entry exists.
 Use --cache-dir to specify a custom cache location (default: ~/.optico_cache).
+
+psf_override unit convention
+-----------------------------
+The --psf-override CLI argument and the OpticoConfig.psf_override field
+both accept the PSF sigma in **LR pixels** (the physically meaningful
+unit produced by optical PSF estimation tools).  run_pipeline multiplies
+the value by final_scale before passing it to deconvolve_color, which
+expects HR pixels.  Example: --psf-override 0.8 with --scale 2 results
+in deconvolve_color receiving psf_override=1.6 (HR pixels).
 """
 import argparse
 import logging
@@ -221,6 +230,13 @@ def run_pipeline(
     -------
     np.ndarray
         Final high-resolution output (BGR, uint8).
+
+    Notes
+    -----
+    psf_override unit: config.psf_override is interpreted as **LR pixels**.
+    run_pipeline scales it by final_scale before passing to deconvolve_color
+    (which expects HR pixels).  The CLI --psf-override argument follows the
+    same LR-pixel convention.
     """
     if config is None:
         config = OpticoConfig()
@@ -379,6 +395,16 @@ def run_pipeline(
     # Phase 9: Adaptive Wiener Deconvolution                              #
     # ------------------------------------------------------------------ #
     if not config.skip_deconv:
+        # psf_override is stored in LR pixels (physically meaningful unit).
+        # deconvolve_color expects HR pixels, so scale up here.
+        psf_override_hr: Optional[float] = None
+        if config.psf_override is not None:
+            psf_override_hr = config.psf_override * final_scale
+            logger.info(
+                "Phase 9: psf_override %.3f LR px → %.3f HR px (scale=%.2f)",
+                config.psf_override, psf_override_hr, final_scale,
+            )
+
         logger.info(
             "-- Phase 9: Adaptive Wiener Deconvolution (jpeg_input=%s) --",
             config.jpeg_input,
@@ -386,7 +412,7 @@ def run_pipeline(
         hr_image = deconvolve_color(
             hr_image,
             scale=final_scale,
-            psf_override=config.psf_override,
+            psf_override=psf_override_hr,
             jpeg_input=bool(config.jpeg_input),
         )
     else:
@@ -434,6 +460,8 @@ def main() -> None:
             "  python -m backend.pipeline --input ./burst --no-cache\n"
             "  python -m backend.pipeline --input ./burst --jpeg\n"
             "  python -m backend.pipeline --input ./burst --raw\n"
+            "  python -m backend.pipeline --input ./burst --jpeg --psf-override 0.8\n"
+            "  python -m backend.pipeline --input ./burst --raw --psf-override 0.8\n"
         ),
     )
     parser.add_argument(
@@ -472,6 +500,19 @@ def main() -> None:
         "--cache-dir", type=str, default=None,
         help=f"Cache directory (default: {DEFAULT_CACHE_DIR})",
     )
+    parser.add_argument(
+        "--psf-override", type=float, default=None,
+        metavar="SIGMA_LR",
+        help=(
+            "Override the Wiener PSF sigma in LR pixels (the unit produced "
+            "by optical PSF estimation tools). The value is automatically "
+            "scaled to HR pixels internally (sigma_lr × final_scale). "
+            "When set, the JPEG PSF scale factor (×1.35) is skipped; use "
+            "--jpeg or --raw independently to control noise-floor behaviour. "
+            "Example: --psf-override 0.8 with --scale 2 applies a "
+            "1.6 HR-pixel PSF to the deconvolution."
+        ),
+    )
 
     # JPEG / RAW override flags
     jpeg_group = parser.add_mutually_exclusive_group()
@@ -506,6 +547,8 @@ def main() -> None:
     )
     if args.align_scale is not None:
         config_kwargs["align_scale"] = args.align_scale
+    if args.psf_override is not None:
+        config_kwargs["psf_override"] = args.psf_override
     if args.jpeg:
         config_kwargs["jpeg_input"] = True
     elif args.raw:
