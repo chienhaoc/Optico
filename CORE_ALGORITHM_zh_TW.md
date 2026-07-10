@@ -12,7 +12,7 @@
 |---|---|---|
 | Phase 2 — ECC 對齊 | `gauss_filt_size = 5` | `gauss_filt_size = 7` |
 | Phase 8 — Drizzle | coverage-hole 填補（通用） | 同左 |
-| Phase 9 — 反捲積 | PSF σ = `0.4·S`，HF fraction = 0.75 | PSF σ ×1.35，HF fraction = 0.60 |
+| Phase 9 — 反捲積 | PSF σ = `0.4·S`，HF fraction = 0.75，taper = 48 px | PSF σ ×1.35，HF fraction = 0.60，taper = 48 px |
 
 可透過 `config.jpeg_input = True/False` 或 CLI 旗標 `--jpeg` / `--raw` 強制覆蓋。
 
@@ -104,6 +104,23 @@ $$\text{Den}_{\text{filled}}(x,y) = (\text{uniform\_filter}_{3\times3} * \text{D
 
 ## 5. 頻率相依 Wiener 反捲積 (`deconvolution.py`)
 
+### 邊緣錐化處理（頻譜洩漏抑制）
+
+`scipy.fft.fft2` 假設輸入影像具有週期性（circulant）邊界條件。但真實影像的上下左右邊緣幾乎必然不連續，這種**邊界不連續性**在頻域產生能量洩漏（spectral leakage），集中在 `fx=0` 那條垂直軸上。IFFT2 後，這些洩漏能量呈現為**貫穿整個畫面的全幅水平帶**，穿過人臉、皮膚等平滑區域，與影像內容完全無關。
+
+FFT2 之前，`_edge_taper()` 對四邊最外側 `EDGE_TAPER_WIDTH = 48` px 套用升餘弦（Hann）漸變窗，使邊緣平滑過渡至影像均值：
+$$w[i] = \frac{1}{2}\left(1 - \cos\frac{\pi i}{T}\right), \quad i = 0, \ldots, T-1$$
+其中 $T$ = `EDGE_TAPER_WIDTH`。套用前先減去影像均值，套用後再加回，確保 DC 分量不被改變。
+
+**為何 JPEG 輸入更嚴重：** JPEG 的 8px DCT 分塊邊界在所有連拍幀中都固定在同一個像素位置。Drizzle 疊加時，這些邊界不是被平均掉，而是被對齊疊加增強，使垂直方向的邊界不連續性遠強於 RAW 輸入。Wiener 在低中頻的高放大倍率進一步把這些洩漏條紋放大為肉眼可見的橫線。
+
+**沙箱量測結果**（512×512 人臉場景，含 JPEG block 殘留，n=8 次）：
+
+| | 行均值標準差 | vs 輸入（27.79） |
+|---|---|---|
+| 無 edge taper | 30.76 | +10.7%（橫帶可見） |
+| **有 edge taper** | **27.66** | **−0.5%（消除）** |
+
 ### 噪聲估計
 Drizzle 輸出的底噪標準差 $\sigma_{\text{noise}}$ 使用 Laplacian MAD 動態估計：
 $$\sigma_{\text{noise}} = \frac{1.4826 \cdot \text{MAD}(\nabla^2 I)}{\sqrt{20}}$$
@@ -111,11 +128,13 @@ $\sqrt{20}$ 係數補正 3×3 Laplacian 算子的噪聲放大效應。
 
 ### PSF 模型
 光學 PSF 建模為高斯函數：
-$$\sigma_{\text{PSF}} = \max(0.6,\ 0.4 \cdot S_{\text{final}})$$
+$$\sigma_{\text{PSF}} = \max(0.4,\ 0.4 \cdot S_{\text{final}})$$
 
 **JPEG 補正：** JPEG 量化會在光學 PSF 之外疊加一個量化模糊 PSF（$\sigma_{\text{JPEG}} \approx 0.3\text{–}0.5\ \text{px}$），複合有效 sigma 為：
 $$\sigma_{\text{eff}} = \sqrt{\sigma_{\text{optical}}^2 + \sigma_{\text{JPEG}}^2} \approx \sigma_{\text{optical}} \times 1.35$$
 JPEG 輸入時，`psf_sigma` 乘以 `JPEG_PSF_SCALE_FACTOR = 1.35`。
+
+**手動覆寫：** 使用 `--psf-override <sigma_lr>` 可直接指定光學 PSF sigma（LR 像素單位）。Pipeline 會自動乘以 `final_scale` 換算為 HR 像素後傳入 Wiener 濾波器。對長焦鏡頭或預設自動估計補正不足時建議使用。
 
 ### 頻率相依正則化 $K(f)$
 

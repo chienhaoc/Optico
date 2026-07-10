@@ -12,7 +12,7 @@ Before any processing begins, Optico auto-detects whether the burst images are J
 |---|---|---|
 | Phase 2 — ECC alignment | `gauss_filt_size = 5` | `gauss_filt_size = 7` |
 | Phase 8 — Drizzle | coverage-hole fill (universal) | same |
-| Phase 9 — Deconvolution | PSF σ = `0.4·S`, HF fraction = 0.75 | PSF σ ×1.35, HF fraction = 0.60 |
+| Phase 9 — Deconvolution | PSF σ = `0.4·S`, HF fraction = 0.75, taper = 48 px | PSF σ ×1.35, HF fraction = 0.60, taper = 48 px |
 
 The detection can be overridden via `config.jpeg_input = True/False` or the CLI flags `--jpeg` / `--raw`.
 
@@ -105,6 +105,33 @@ This is equivalent to bilinear interpolation from surrounding well-covered pixel
 
 ## 5. Frequency-Dependent Wiener Deconvolution (`deconvolution.py`)
 
+### Edge Taper (Spectral Leakage Suppression)
+
+`scipy.fft.fft2` assumes the image is circulant (periodic). Real images have
+discontinuous top/bottom/left/right boundaries; this discontinuity creates
+spectral leakage concentrated on the `fx=0` axis. After `IFFT2` the leakage
+appears as **full-width horizontal bands that cross smooth regions such as
+faces** — completely unrelated to image content.
+
+Before FFT2, `_edge_taper()` blends the outermost `EDGE_TAPER_WIDTH = 48`
+pixels on each edge toward the image mean using a raised-cosine (Hann) ramp:
+$$w[i] = \frac{1}{2}\left(1 - \cos\frac{\pi i}{T}\right), \quad i = 0, \ldots, T-1$$
+where $T$ = `EDGE_TAPER_WIDTH`. The image mean is subtracted before tapering
+and restored afterwards, preserving the DC component.
+
+**Why JPEG is more affected:** JPEG 8px DCT block boundaries are co-aligned
+across all burst frames. Drizzle stacking reinforces rather than averages them,
+increasing the vertical boundary discontinuity strength beyond that of RAW
+input. Wiener's low/mid-frequency amplification then magnifies the leakage
+bands into clearly visible stripes.
+
+**Sandbox measurement** (512×512 face scene with JPEG block residuals, n=8 runs):
+
+| | Row-mean std | vs input (27.79) |
+|---|---|---|
+| Without taper | 30.76 | +10.7% ← visible banding |
+| **With taper** | **27.66** | **−0.5% ← eliminated** |
+
 ### Noise Estimation
 The global noise floor standard deviation $\sigma_{\text{noise}}$ is estimated from the Laplacian MAD:
 $$\sigma_{\text{noise}} = \frac{1.4826 \cdot \text{MAD}(\nabla^2 I)}{\sqrt{20}}$$
@@ -112,11 +139,13 @@ The $\sqrt{20}$ factor corrects for the 3×3 Laplacian kernel's noise amplificat
 
 ### PSF Model
 The optical PSF is modeled as a Gaussian with:
-$$\sigma_{\text{PSF}} = \max(0.6,\ 0.4 \cdot S_{\text{final}})$$
+$$\sigma_{\text{PSF}} = \max(0.4,\ 0.4 \cdot S_{\text{final}})$$
 
 **JPEG correction:** JPEG quantisation adds a blur PSF ($\sigma_{\text{JPEG}} \approx 0.3\text{–}0.5\ \text{px}$) on top of the optical PSF. The composite effective sigma is:
 $$\sigma_{\text{eff}} = \sqrt{\sigma_{\text{optical}}^2 + \sigma_{\text{JPEG}}^2} \approx \sigma_{\text{optical}} \times 1.35$$
 For JPEG input, `psf_sigma` is multiplied by `JPEG_PSF_SCALE_FACTOR = 1.35`.
+
+**Manual override:** Use `--psf-override <sigma_lr>` to supply the optical PSF sigma in LR pixels. The pipeline automatically multiplies by `final_scale` to convert to HR pixels before passing to the Wiener filter. Recommended for telephoto lenses or when default auto-estimation under-corrects blur.
 
 ### Frequency-Dependent Regularisation $K(f)$
 
