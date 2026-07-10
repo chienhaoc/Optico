@@ -77,16 +77,30 @@ def _lanczos(x: np.ndarray, a: int = 2) -> np.ndarray:
     """Lanczos kernel: sinc(x) * sinc(x/a) for |x| < a, else 0.
 
     Vectorised over any shaped ndarray.
+
+    Implementation note
+    -------------------
+    The zero-distance case (x ≈ 0) is handled by assigning 1.0 directly
+    to a separate sub-mask *before* computing the sinc formula on the
+    remaining non-zero elements.  This avoids the 0/0 division that
+    np.where(cond, formula, 1.0) would silently evaluate for x=0 elements
+    (numpy evaluates both branches unconditionally), which previously
+    produced RuntimeWarning: invalid value encountered in divide even
+    though the final result was correct.
     """
     out = np.zeros_like(x, dtype=np.float64)
-    mask = np.abs(x) < a
-    x_m = x[mask]
-    pi_x = np.pi * x_m
-    out[mask] = np.where(
-        np.abs(x_m) < 1e-10,
-        1.0,
-        a * np.sin(pi_x) * np.sin(pi_x / a) / (pi_x ** 2),
-    )
+
+    in_support = np.abs(x) < a          # |x| < a: kernel support
+    near_zero  = in_support & (np.abs(x) < 1e-10)   # x ≈ 0 → limit = 1
+    nonzero    = in_support & ~near_zero              # normal sinc case
+
+    out[near_zero] = 1.0
+
+    if nonzero.any():
+        xv    = x[nonzero]
+        pi_x  = np.pi * xv
+        out[nonzero] = a * np.sin(pi_x) * np.sin(pi_x / a) / (pi_x ** 2)
+
     return out
 
 
