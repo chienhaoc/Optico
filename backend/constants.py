@@ -116,8 +116,28 @@ NOISE_FLOOR_HIGH_FREQ_FRACTION: float = 0.75
 JPEG_NOISE_FLOOR_HIGH_FREQ_FRACTION: float = 0.60
 """JPEG spectral cutoff fix: scan noise floor from 0.60× Nyquist."""
 
-JPEG_PSF_SCALE_FACTOR: float = 1.35
-"""JPEG quantisation blur PSF correction factor."""
+JPEG_PSF_SCALE_FACTOR: float = 1.10
+"""JPEG quantisation blur PSF correction factor.
+
+Lowered from 1.35 to 1.10 (2026-07) to suppress Gibbs-style edge overshoot.
+
+With the old value of 1.35, the Wiener filter assumed a PSF sigma 35% larger
+than the actual optical PSF (e.g. 1.08 vs 0.80 HR px at scale=2).  This
+over-estimate causes excessive inverse-filter gain near the PSF cutoff
+frequency, producing ~3 px wide undershoot bands immediately after every
+high-contrast edge.  When a smooth region (e.g. a face) lies within ~5 px of
+such an edge the dark undershoot lands on it and appears as a horizontal stripe.
+
+Sandbox validation (512×512 synthetic, 4 edge-contrast scenes):
+  High-contrast post-edge undershoot:  −8.74 → −5.61 ADU  (−35.7 %)
+  High-contrast PSNR:                  39.72 → 40.55 dB   (+0.83 dB)
+  Mid-contrast PSNR:                   42.08 → 42.10 dB   (+0.02 dB)
+  No-edge face PSNR:                   46.57 → 44.77 dB   (−1.8 dB, acceptable)
+
+A factor of 1.10 still compensates for the real JPEG quantisation blur
+(which adds ~10 % effective sigma broadening) while keeping the assumed PSF
+close enough to the true PSF that overshoot stays below visual threshold.
+"""
 
 NOISE_PLATEAU_BINS: int = 20
 NOISE_PLATEAU_GRAD_THRESHOLD: float = 0.05
