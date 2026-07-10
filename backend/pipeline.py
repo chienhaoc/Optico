@@ -1,6 +1,7 @@
 """Optico MFSR Engine — End-to-End Pipeline.
 
 Orchestrates the full MFSR processing chain:
+  Phase 0 : JPEG vs RAW source detection
   Phase 1 : Load burst images
   Phase 2 : Coarse sub-pixel alignment (relative to frame 0)
   Phase 3 : Reference frame selection (Harmony Anchor)
@@ -11,6 +12,18 @@ Orchestrates the full MFSR processing chain:
   Phase 8 : Drizzle multi-frame stacking
   Phase 9 : Adaptive Wiener deconvolution
   Phase 10: Final output
+
+Phase 0 — JPEG vs RAW detection
+--------------------------------
+JPEG input has three distinct failure modes compared to RAW/PNG:
+  1. 8×8 DCT inter-block edges bias ECC sub-pixel alignment (Phase 2)
+  2. Quantisation PSF adds residual blur on top of optical PSF (Phase 9)
+  3. JPEG spectral cutoff inflates noise_floor in plateau detection (Phase 9)
+
+detect_jpeg_source() reads the first 2 bytes of each input file to check
+for the JPEG SOI marker (0xFF 0xD8).  The result is stored in
+config.jpeg_input and propagated to Phases 2 and 9.  Override
+config.jpeg_input manually if auto-detection is incorrect.
 
 Drizzle Cache
 -------------
@@ -39,7 +52,11 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from .constants import OpticoConfig
+from .constants import (
+    OpticoConfig,
+    JPEG_ECC_GAUSS_FILT_SIZE,
+    ECC_GAUSS_FILT_SIZE,
+)
 from .alignment import (
     align_images_ecc,
     calculate_dither_quality_neff,
@@ -57,6 +74,50 @@ from .cache import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Phase 0: JPEG vs RAW detection
+# ---------------------------------------------------------------------------
+
+def detect_jpeg_source(image_paths: list[Path]) -> bool:
+    """Detect whether the burst images are JPEG-sourced.
+
+    Reads the first 2 bytes of each file and checks for the JPEG SOI
+    marker (0xFF 0xD8).  Returns True if the majority of files are JPEG.
+
+    JPEG input requires three downstream adjustments:
+      - Phase 2: larger ECC Gaussian filter to suppress DCT block edges
+      - Phase 9: enlarged PSF sigma for quantisation blur
+      - Phase 9: lower noise-floor scan range to avoid JPEG spectral cutoff
+
+    Parameters
+    ----------
+    image_paths : list[Path]
+        File paths of the burst images.
+
+    Returns
+    -------
+    bool
+        True if images are likely JPEG-sourced.
+    """
+    if not image_paths:
+        return False
+    jpeg_count = 0
+    for p in image_paths:
+        try:
+            with open(p, "rb") as f:
+                header = f.read(2)
+            if header == b"\xff\xd8":
+                jpeg_count += 1
+        except OSError:
+            pass
+    result = jpeg_count > len(image_paths) / 2
+    logger.info(
+        "Phase 0: source detection — %d/%d files are JPEG → jpeg_input=%s",
+        jpeg_count, len(image_paths), result,
+    )
+    return result
 
 
 def load_burst_images(input_dir: str) -> tuple[list[np.ndarray], list[Path]]:
@@ -92,7 +153,6 @@ def load_burst_images(input_dir: str) -> tuple[list[np.ndarray], list[Path]]:
         image_files.extend(input_path.glob(ext))
         image_files.extend(input_path.glob(ext.upper()))
 
-    # Deduplicate and sort
     image_files = sorted(set(image_files))
 
     if not image_files:
@@ -150,8 +210,8 @@ def run_pipeline(
     output_path : str, optional
         If provided, saves the result to this path.
     image_paths : list[Path], optional
-        File paths corresponding to `images`. Required for cache lookup.
-        If None, cache is disabled for this run.
+        File paths corresponding to `images`. Required for cache lookup
+        and JPEG auto-detection.  If None, both are disabled.
     use_cache : bool
         If False, skip cache lookup and always recompute Phases 2-8.
     cache_dir : Path
@@ -181,6 +241,36 @@ def run_pipeline(
     logger.info("=" * 60)
 
     # ------------------------------------------------------------------ #
+    # Phase 0: JPEG vs RAW detection                                      #
+    # ------------------------------------------------------------------ #
+    if config.jpeg_input is None:
+        if image_paths is not None:
+            jpeg_detected = detect_jpeg_source(image_paths)
+        else:
+            jpeg_detected = False
+            logger.info(
+                "Phase 0: no image_paths provided — assuming RAW/PNG input."
+            )
+        # Store detection result in a local copy of config so the
+        # original caller's config object is not mutated.
+        from dataclasses import replace
+        config = replace(config, jpeg_input=jpeg_detected)
+    else:
+        jpeg_detected = config.jpeg_input
+        logger.info(
+            "Phase 0: jpeg_input manually set to %s", jpeg_detected
+        )
+
+    # Apply JPEG-specific ECC filter size if not manually overridden
+    if jpeg_detected and config.ecc_gauss_filt_size == ECC_GAUSS_FILT_SIZE:
+        from dataclasses import replace
+        config = replace(config, ecc_gauss_filt_size=JPEG_ECC_GAUSS_FILT_SIZE)
+        logger.info(
+            "Phase 0: JPEG input — ECC Gaussian filter: %d → %d px",
+            ECC_GAUSS_FILT_SIZE, JPEG_ECC_GAUSS_FILT_SIZE,
+        )
+
+    # ------------------------------------------------------------------ #
     # Drizzle Cache Lookup (Phases 2-8)                                   #
     # ------------------------------------------------------------------ #
     drizzle_result = None
@@ -193,7 +283,6 @@ def run_pipeline(
         drizzle_result = load_drizzle_cache(cache_key, cache_dir=cache_dir)
 
     if drizzle_result is not None:
-        # ---- Cache HIT: skip Phases 2-8 ---- #
         hr_image = drizzle_result["hr_image"]
         final_scale = drizzle_result["final_scale"]
         retained_ratio = drizzle_result["retained_ratio"]
@@ -205,7 +294,6 @@ def run_pipeline(
             final_scale, retained_ratio, dither_neff,
         )
     else:
-        # ---- Cache MISS: run full Phases 2-8 ---- #
         if use_cache and image_paths is not None:
             logger.info("-- Cache: MISS — running full pipeline --")
         else:
@@ -274,7 +362,6 @@ def run_pipeline(
             scale=final_scale, ref_idx=ref_idx, config=config,
         )
 
-        # -- Save to cache --
         if use_cache and cache_key is not None and image_paths is not None:
             save_drizzle_cache(
                 cache_key=cache_key,
@@ -292,10 +379,15 @@ def run_pipeline(
     # Phase 9: Adaptive Wiener Deconvolution                              #
     # ------------------------------------------------------------------ #
     if not config.skip_deconv:
-        logger.info("-- Phase 9: Adaptive Wiener Deconvolution --")
+        logger.info(
+            "-- Phase 9: Adaptive Wiener Deconvolution (jpeg_input=%s) --",
+            config.jpeg_input,
+        )
         hr_image = deconvolve_color(
-            hr_image, scale=final_scale,
+            hr_image,
+            scale=final_scale,
             psf_override=config.psf_override,
+            jpeg_input=bool(config.jpeg_input),
         )
     else:
         logger.info("-- Phase 9: Skipped Deconvolution (skip_deconv=True) --")
@@ -314,8 +406,8 @@ def run_pipeline(
         hr_w, hr_h, final_scale, lr_w, lr_h,
     )
     logger.info(
-        "  Safe cap: %.2f | Retained ratio: %.3f",
-        safe_cap, retained_ratio,
+        "  Safe cap: %.2f | Retained ratio: %.3f | jpeg_input: %s",
+        safe_cap, retained_ratio, config.jpeg_input,
     )
     logger.info("  Dither N_eff: %.2f", dither_neff)
     logger.info("  Total time: %.1fs", elapsed)
@@ -340,7 +432,8 @@ def main() -> None:
             "  python -m backend.pipeline --input ./burst --scale 2.5\n"
             "  python -m backend.pipeline --input ./burst --no-deconv\n"
             "  python -m backend.pipeline --input ./burst --no-cache\n"
-            "  python -m backend.pipeline --input ./burst --cache-dir /tmp/optico_cache\n"
+            "  python -m backend.pipeline --input ./burst --jpeg\n"
+            "  python -m backend.pipeline --input ./burst --raw\n"
         ),
     )
     parser.add_argument(
@@ -369,7 +462,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--align-scale", type=float, default=None,
-        help="Override ECC alignment downscale factor (default: auto based on image size)",
+        help="Override ECC alignment downscale factor (default: auto)",
     )
     parser.add_argument(
         "--no-cache", action="store_true",
@@ -377,11 +470,20 @@ def main() -> None:
     )
     parser.add_argument(
         "--cache-dir", type=str, default=None,
-        help=(
-            f"Cache directory (default: {DEFAULT_CACHE_DIR}). "
-            "Stores Drizzle results for fast deconvolution re-runs."
-        ),
+        help=f"Cache directory (default: {DEFAULT_CACHE_DIR})",
     )
+
+    # JPEG / RAW override flags
+    jpeg_group = parser.add_mutually_exclusive_group()
+    jpeg_group.add_argument(
+        "--jpeg", action="store_true",
+        help="Force JPEG-mode processing (ECC filter=7, PSF×1.35, noise HF=0.60)",
+    )
+    jpeg_group.add_argument(
+        "--raw", action="store_true",
+        help="Force RAW/PNG-mode processing regardless of file extension",
+    )
+
     parser.add_argument(
         "--verbose", "-v", action="store_true",
         help="Enable debug logging",
@@ -396,8 +498,7 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
-    # Build config; only pass align_scale if user explicitly provided it
-    config_kwargs = dict(
+    config_kwargs: dict = dict(
         target_scale=args.scale,
         pixfrac=args.pixfrac,
         num_chunks=args.chunks,
@@ -405,6 +506,10 @@ def main() -> None:
     )
     if args.align_scale is not None:
         config_kwargs["align_scale"] = args.align_scale
+    if args.jpeg:
+        config_kwargs["jpeg_input"] = True
+    elif args.raw:
+        config_kwargs["jpeg_input"] = False
 
     config = OpticoConfig(**config_kwargs)
 

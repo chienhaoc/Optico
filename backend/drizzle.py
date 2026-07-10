@@ -5,6 +5,28 @@ adapted for handheld burst photography with:
 - Weighted accumulation using dynamic motion masks
 - Active Memory Chunking for bounded RAM usage
 - Per-channel processing for color fidelity
+- Coverage-hole fill for grid-artifact suppression (see below)
+
+Grid-artifact fix (2026-07)
+---------------------------
+The backward 4-neighbour overlap kernel has a structural blind spot:
+when the nearest LR pixel centre projects to a position > r_droplet
+away from an HR pixel centre, overlap = 0 for that LR pixel.  If all
+N frames share similar sub-pixel offsets, the same HR pixels are
+under-covered in every frame, producing a periodic grid of low-weight
+pixels that survive normalisation as a visible bright/dark pattern.
+
+Fix: after accumulation, HR pixels whose denominator falls below
+DRIZZLE_COVERAGE_FLOOR_RATIO × chunk_median_denominator are filled
+from a fast 3×3 Gaussian-weighted average of surrounding pixels
+(bilinear coverage-hole fill).  This is applied per-chunk before
+normalisation so the memory-bounded architecture is preserved.
+
+Cross-phase dependencies
+------------------------
+JPEG input → JPEG_ECC_GAUSS_FILT_SIZE (Phase 2) improves sub-pixel
+offset accuracy, which makes dither N_eff slightly higher and reduces
+the frequency of coverage holes at low scale factors.
 
 Performance note (2025-07 audit)
 ---------------------------------
@@ -30,13 +52,74 @@ from typing import Optional
 
 import cv2
 import numpy as np
+from scipy.ndimage import uniform_filter
 
-from .constants import OpticoConfig, DRIZZLE_WEIGHT_FLOOR
+from .constants import (
+    OpticoConfig,
+    DRIZZLE_WEIGHT_FLOOR,
+    DRIZZLE_COVERAGE_FLOOR_RATIO,
+)
 
 logger = logging.getLogger(__name__)
 
 # Pre-built neighbour offsets: (dx, dy) ∈ {0, 1}²  — shape (4, 2)
 _NEIGHBOUR_OFFSETS = np.array([[0, 0], [0, 1], [1, 0], [1, 1]], dtype=np.int32)
+
+
+def _fill_coverage_holes(
+    numerator: np.ndarray,
+    denominator: np.ndarray,
+    floor_ratio: float = DRIZZLE_COVERAGE_FLOOR_RATIO,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fill HR pixels with near-zero accumulation weight.
+
+    Pixels whose denominator < floor_ratio * median(denominator) are
+    coverage holes caused by the 4-neighbour overlap blind spot.
+    They are replaced by a 3×3 neighbourhood average (computed via
+    scipy uniform_filter for speed), which is equivalent to bilinear
+    interpolation from surrounding well-covered pixels.
+
+    Parameters
+    ----------
+    numerator : ndarray, shape (H, W, 3), float64
+    denominator : ndarray, shape (H, W), float64
+    floor_ratio : float
+        Fraction of median below which a pixel is considered a hole.
+        0.0 disables the fix entirely.
+
+    Returns
+    -------
+    numerator, denominator with holes filled in-place.
+    """
+    if floor_ratio <= 0.0:
+        return numerator, denominator
+
+    median_denom = float(np.median(denominator[denominator > DRIZZLE_WEIGHT_FLOOR]))
+    if median_denom <= 0.0:
+        return numerator, denominator
+
+    threshold = floor_ratio * median_denom
+    hole_mask = denominator < threshold  # (H, W) bool
+
+    if not hole_mask.any():
+        return numerator, denominator
+
+    n_holes = int(hole_mask.sum())
+    logger.debug(
+        "Coverage-hole fill: %d HR pixels below %.1f%% of median denom (%.4f)",
+        n_holes, floor_ratio * 100, threshold,
+    )
+
+    # 3×3 neighbourhood average for denominator and each numerator channel
+    # uniform_filter is O(H*W) regardless of kernel size
+    denom_smooth = uniform_filter(denominator, size=3, mode="reflect")
+    denominator = np.where(hole_mask, denom_smooth, denominator)
+
+    for c in range(numerator.shape[2]):
+        num_c_smooth = uniform_filter(numerator[:, :, c], size=3, mode="reflect")
+        numerator[:, :, c] = np.where(hole_mask, num_c_smooth, numerator[:, :, c])
+
+    return numerator, denominator
 
 
 def _drizzle_chunk_vectorized(
@@ -214,6 +297,10 @@ def drizzle_stack(
             images, M_list, weight_maps, scale, pixfrac,
             y_start, y_end, hr_w,
         )
+
+        # Coverage-hole fill: smooth out backward-lookup blind spots
+        # before normalisation to prevent grid artifacts.
+        numerator, denominator = _fill_coverage_holes(numerator, denominator)
 
         safe_denom = np.maximum(denominator, DRIZZLE_WEIGHT_FLOOR)
         output[y_start:y_end] = (

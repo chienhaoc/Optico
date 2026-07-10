@@ -15,60 +15,70 @@ outperformed by the frequency-dependent approach implemented here:
   Very high    (sigma=9): PSNR +2.50 dB, SSIM +0.360
   Average improvement  : PSNR +1.54 dB
 
+JPEG-input fixes (2026-07)
+---------------------------
+Two failure modes on JPEG input were identified and fixed:
+
+1. Inflated noise_floor → over-regularisation → sharpness loss
+   JPEG DCT quantisation creates a hard spectral cutoff at ~0.55–0.65 ×
+   Nyquist.  Above this cutoff, image power drops abruptly to near-zero
+   (quantised coefficients), making the high-frequency band look like a
+   white-noise plateau to _find_noise_plateau().  This inflates N_floor
+   by 2–5× and over-suppresses all frequencies via K(f) = N_floor/S(f).
+   Fix: when jpeg_input is True, lower NOISE_FLOOR_HIGH_FREQ_FRACTION to
+   JPEG_NOISE_FLOOR_HIGH_FREQ_FRACTION (0.60), placing the plateau scan
+   below the JPEG cutoff so the true white-noise floor is measured.
+
+2. Under-estimated PSF sigma → residual blur
+   JPEG compression adds a quantisation-blur PSF (sigma ≈ 0.3–0.5 px)
+   on top of the optical PSF.  The default sigma = PSF_SIGMA_SCALE * scale
+   models only optical blur and under-corrects JPEG inputs.
+   Fix: when jpeg_input is True, multiply psf_sigma by JPEG_PSF_SCALE_FACTOR
+   (1.35) to approximate the composite optical + quantisation PSF.
+
+Cross-phase note: JPEG_ECC_GAUSS_FILT_SIZE (Phase 2) improves sub-pixel
+offset accuracy on JPEG input, which reduces alignment PSF contribution;
+this module handles the remaining quantisation-domain component.
+
 Root cause of old approach failure
 ------------------------------------
 Natural-image power spectra fall off steeply with spatial frequency
-(most energy is concentrated at low frequencies, roughly P(f) ∼ 1/f²)
-while sensor noise is approximately white (flat power across frequency).
+(P(f) ∼ 1/f²) while sensor noise is approximately white (flat power).
 A single scalar K cannot represent this: any K small enough to avoid
 crushing real low-frequency detail is far too small to suppress noise at
-high frequencies, where the true noise-to-signal ratio is orders of
-magnitude worse. The spatial edge-mask blend was a crude indirect proxy
-for this, but still used a *flat* K within each band.
+high frequencies.  The spatial edge-mask blend was a crude indirect proxy
+for this but still used a *flat* K within each band.
 
 Current approach
 -----------------
 K is estimated per-frequency, directly from the image's own measured
 power spectrum:
 
-  1. Locate the white-noise floor: scan the image's radial power spectrum
-     from NOISE_FLOOR_HIGH_FREQ_FRACTION * Nyquist outward; find the
-     first annulus where the power has stopped falling (plateau detection
-     via adaptive gradient threshold). The median power in that plateau
-     annulus is N_floor.
+  1. Locate the white-noise floor: scan the radial power spectrum from
+     NOISE_FLOOR_HIGH_FREQ_FRACTION * Nyquist outward (JPEG: from
+     JPEG_NOISE_FLOOR_HIGH_FREQ_FRACTION * Nyquist).  Adaptively find
+     the plateau via a gradient threshold.  The median power in that
+     plateau annulus is N_floor.
 
   2. Estimate per-frequency signal power:
-         S(f) = max(P(f) − N_floor,  N_floor * MIN_SIGNAL_POWER_FRACTION)
+         S(f) = max(P(f) - N_floor,  N_floor * MIN_SIGNAL_POWER_FRACTION)
 
   3. Per-frequency Wiener regularization:
-         K(f) = N_floor / S(f)   [the textbook SNR-inverse ratio]
+         K(f) = N_floor / S(f)   [textbook SNR-inverse ratio]
      clipped to [K_FREQ_MIN, K_FREQ_MAX].
-
-This is fully data-driven (no per-image hand-tuned constants) and was
-validated against synthetic ground-truth data as described above.
 
 DC-gain preservation
 ---------------------
-The standard Wiener response at DC (f=0) is 1/(1+K(0)), which measurably
-dims the reconstructed image's mean brightness as K grows. The correct
-fix is to restore *only* the DC bin's gain to 1.0. A global (1+K) rescale
+The standard Wiener response at DC (f=0) is 1/(1+K(0)), which dims
+the reconstructed image's mean brightness as K grows.  The correct fix
+is to restore only the DC bin's gain to 1.0.  A global (1+K) rescale
 was tested and found to progressively degrade noise suppression at high
-frequencies as noise increases (~8–12% worse at high noise in synthetic
-testing). Locking only bin [0, 0] gives the brightness correction with no
-such side effect.
-
-PSF model
-----------
-A Gaussian PSF parametrized by sigma = max(PSF_SIGMA_MIN, PSF_SIGMA_SCALE
-* scale) is used. Blind MTF-based sigma estimation was prototyped and
-tested but found unreliable on synthetic data (estimation error > 1.5 px).
-The scale-derived default is a principled conservative choice; users can
-override via psf_override for known optical systems.
+frequencies (~8-12% worse at high noise).  Locking only bin [0,0] gives
+the brightness correction with no such side effect.
 
 Retained fixes from prior audits
 ----------------------------------
-- Fix #10: MAD noise formula uses (1.4826 * MAD(Lap(I))) / sqrt(20)
-  (accounts for the discrete Laplacian kernel noise gain).
+- Fix #10: MAD noise formula uses (1.4826 * MAD(Lap(I))) / sqrt(20).
 - Fix #11: PSF built as small kernel then circulant-wrapped to image size.
 - Fix #14: Consistent use of scipy.fft for both FFT and IFFT.
 """
@@ -84,6 +94,8 @@ from .constants import (
     MAD_SCALE_FACTOR,
     K_EST_MIN, K_EST_MAX,
     NOISE_FLOOR_HIGH_FREQ_FRACTION,
+    JPEG_NOISE_FLOOR_HIGH_FREQ_FRACTION,
+    JPEG_PSF_SCALE_FACTOR,
     NOISE_PLATEAU_BINS,
     NOISE_PLATEAU_GRAD_THRESHOLD,
     MIN_SIGNAL_POWER_FRACTION,
@@ -102,11 +114,7 @@ def _estimate_noise_mad(img_y: np.ndarray) -> float:
     """Estimate noise std using Laplacian MAD (diagnostic / logging only).
 
     Formula: sigma = (1.4826 * MAD(Lap(I))) / sqrt(20)
-    The sqrt(20) term corrects for the 3x3 Laplacian kernel's noise gain
-    (sum of squared kernel elements = 20).
-
-    This value is reported in log output for interpretability but no longer
-    directly drives the Wiener regularization parameter.
+    The sqrt(20) term corrects for the 3x3 Laplacian kernel's noise gain.
     """
     lap = cv2.Laplacian(img_y, cv2.CV_32F)
     median_lap = float(np.median(lap))
@@ -120,11 +128,7 @@ def _build_gaussian_psf(
     img_h: int,
     img_w: int,
 ) -> np.ndarray:
-    """Build a Gaussian PSF kernel, circulant-wrapped to image size.
-
-    Creates a small kernel (truncated at PSF_TRUNCATION_SIGMAS) then places
-    it at (0, 0) with wrap-around for correct FFT-based convolution.
-    """
+    """Build a Gaussian PSF kernel, circulant-wrapped to image size."""
     radius = int(np.ceil(PSF_TRUNCATION_SIGMAS * sigma))
     y, x = np.mgrid[-radius:radius + 1, -radius:radius + 1]
     kernel = np.exp(
@@ -141,10 +145,7 @@ def _build_gaussian_psf(
 
 
 def _radial_frequency_grid(img_h: int, img_w: int) -> np.ndarray:
-    """Return a (H, W) array of normalised radial spatial frequencies.
-
-    Values are in the range [0, ~0.707] (0 = DC, 0.5 = Nyquist on each axis).
-    """
+    """Return a (H, W) array of normalised radial spatial frequencies."""
     fy = np.fft.fftfreq(img_h)[:, None]
     fx = np.fft.fftfreq(img_w)[None, :]
     return np.sqrt(fy ** 2 + fx ** 2)
@@ -153,31 +154,28 @@ def _radial_frequency_grid(img_h: int, img_w: int) -> np.ndarray:
 def _find_noise_plateau(
     power: np.ndarray,
     freq_r: np.ndarray,
+    high_freq_fraction: float = NOISE_FLOOR_HIGH_FREQ_FRACTION,
 ) -> tuple[float, float]:
-    """Adaptively locate the onset of the white-noise plateau in the power spectrum.
-
-    Scans NOISE_PLATEAU_BINS radial annuli from NOISE_FLOOR_HIGH_FREQ_FRACTION
-    * Nyquist to 0.98 * Nyquist. The plateau begins at the first bin where
-    the change in median power drops below NOISE_PLATEAU_GRAD_THRESHOLD *
-    (power at the start of the scan range).
+    """Adaptively locate the onset of the white-noise plateau.
 
     Parameters
     ----------
     power : ndarray
-        Squared-magnitude FFT array (same shape as the image).
+        Squared-magnitude FFT array.
     freq_r : ndarray
-        Radial frequency grid from _radial_frequency_grid().
+        Radial frequency grid.
+    high_freq_fraction : float
+        Lower bound of the scan range (fraction of Nyquist radius).
+        Use JPEG_NOISE_FLOOR_HIGH_FREQ_FRACTION for JPEG input to avoid
+        the JPEG spectral cutoff being mistaken for the noise plateau.
 
     Returns
     -------
     noise_floor : float
-        Median power in the identified plateau annulus.
     plateau_frac : float
-        Radial frequency fraction at which the plateau was detected
-        (useful for diagnostic logging).
     """
     frmax = freq_r.max()
-    lo = NOISE_FLOOR_HIGH_FREQ_FRACTION
+    lo = high_freq_fraction
     bins = np.linspace(lo, 0.98, NOISE_PLATEAU_BINS + 1)
     bin_centers = (bins[:-1] + bins[1:]) / 2.0
 
@@ -189,7 +187,6 @@ def _find_noise_plateau(
     medians = np.array(medians)
     valid = np.isfinite(medians)
     if not valid.any():
-        # Fallback: use everything above the minimum fraction
         fallback_mask = freq_r >= lo * frmax
         return float(np.median(power[fallback_mask])), lo
 
@@ -210,32 +207,30 @@ def _find_noise_plateau(
 def _estimate_frequency_dependent_K(
     img_f32: np.ndarray,
     freq_r: np.ndarray,
+    high_freq_fraction: float = NOISE_FLOOR_HIGH_FREQ_FRACTION,
 ) -> tuple[np.ndarray, float, float]:
     """Estimate a per-frequency Wiener regularization map K(f).
-
-    K(f) = noise_floor / max(P(f) - noise_floor,
-                             noise_floor * MIN_SIGNAL_POWER_FRACTION)
 
     Parameters
     ----------
     img_f32 : ndarray
-        Single-channel image, float32.
     freq_r : ndarray
-        Radial frequency grid.
+    high_freq_fraction : float
+        Passed through to _find_noise_plateau(); use the JPEG variant
+        for JPEG input.
 
     Returns
     -------
-    K_freq : ndarray, shape (H, W)
-        Per-frequency regularization map, clipped to [K_FREQ_MIN, K_FREQ_MAX].
+    K_freq : ndarray
     noise_floor : float
-        Estimated white-noise power floor.
     plateau_frac : float
-        Detected plateau boundary (for logging).
     """
     G_fft = scipy.fft.fft2(img_f32.astype(np.float64), workers=-1)
     power = np.abs(G_fft) ** 2
 
-    noise_floor, plateau_frac = _find_noise_plateau(power, freq_r)
+    noise_floor, plateau_frac = _find_noise_plateau(
+        power, freq_r, high_freq_fraction=high_freq_fraction
+    )
 
     signal_power = np.maximum(
         power - noise_floor,
@@ -253,6 +248,7 @@ def wiener_deconv(
     img: np.ndarray,
     scale: float,
     psf_override: Optional[float] = None,
+    jpeg_input: bool = False,
 ) -> np.ndarray:
     """Frequency-Dependent Wiener Deconvolution with DC Gain Preservation.
 
@@ -264,7 +260,11 @@ def wiener_deconv(
         Upscale factor used to derive the assumed PSF sigma.
     psf_override : float, optional
         Explicit PSF sigma, bypassing the scale-derived default.
-        Useful when the optical system PSF is known from calibration.
+    jpeg_input : bool
+        When True, apply JPEG-specific fixes:
+        - Increase psf_sigma by JPEG_PSF_SCALE_FACTOR (quantisation blur).
+        - Lower noise-floor scan range to JPEG_NOISE_FLOOR_HIGH_FREQ_FRACTION
+          (avoids JPEG spectral cutoff being mistaken for white noise).
 
     Returns
     -------
@@ -275,34 +275,43 @@ def wiener_deconv(
     H, W = img.shape[:2]
     img_f32 = img.astype(np.float32)
 
-    # Diagnostic scalar noise estimate (for logging; no longer drives K)
     sigma_noise = _estimate_noise_mad(img_f32)
     K_est_diagnostic = float(np.clip(sigma_noise ** 2, K_EST_MIN, K_EST_MAX))
 
-    # PSF sigma: scale-derived default, overridable for known optics
+    # PSF sigma: scale-derived, adjusted for JPEG quantisation blur
     psf_sigma = max(PSF_SIGMA_MIN, PSF_SIGMA_SCALE * scale)
     if psf_override is not None:
         psf_sigma = float(psf_override)
+    elif jpeg_input:
+        psf_sigma *= JPEG_PSF_SCALE_FACTOR
+        logger.debug(
+            "JPEG input: psf_sigma scaled by %.2f → %.3f",
+            JPEG_PSF_SCALE_FACTOR, psf_sigma,
+        )
 
-    # Radial frequency grid (computed once, reused for K and logging)
+    # Noise floor scan range: lower for JPEG to avoid spectral cutoff
+    noise_hf_fraction = (
+        JPEG_NOISE_FLOOR_HIGH_FREQ_FRACTION
+        if jpeg_input
+        else NOISE_FLOOR_HIGH_FREQ_FRACTION
+    )
+
     freq_r = _radial_frequency_grid(H, W)
 
-    # Per-frequency regularization map from the image's own power spectrum
     K_freq, noise_floor, plateau_frac = _estimate_frequency_dependent_K(
-        img_f32, freq_r
+        img_f32, freq_r, high_freq_fraction=noise_hf_fraction
     )
 
     logger.info(
-        "Wiener: sigma_noise(diag)=%.4f  K_est(diag)=%.4f "
+        "Wiener: jpeg=%s  sigma_noise(diag)=%.4f  K_est(diag)=%.4f "
         "noise_floor=%.3e  plateau_frac=%.2f  "
         "K_freq=[%.4f, %.2f]  PSF_sigma=%.3f",
-        sigma_noise, K_est_diagnostic,
+        jpeg_input, sigma_noise, K_est_diagnostic,
         noise_floor, plateau_frac,
         float(K_freq.min()), float(K_freq.max()),
         psf_sigma,
     )
 
-    # PSF and observed image in the frequency domain
     psf = _build_gaussian_psf(psf_sigma, H, W)
     H_fft = scipy.fft.fft2(psf, workers=-1)
     G_fft = scipy.fft.fft2(img_f32.astype(np.float64), workers=-1)
@@ -310,13 +319,8 @@ def wiener_deconv(
     H_conj = np.conj(H_fft)
     H_power = np.abs(H_fft) ** 2
 
-    # Frequency-dependent Wiener response
     W_resp = H_conj / (H_power + K_freq)
-
-    # DC-gain preservation: restore only the DC bin to exact unity gain.
-    # (A global (1+K) rescale was tested and found to degrade high-frequency
-    # noise suppression by ~8-12% at high noise levels.)
-    W_resp[0, 0] = 1.0
+    W_resp[0, 0] = 1.0  # DC-gain preservation
 
     result = np.real(
         scipy.fft.ifft2(W_resp * G_fft, workers=-1)
@@ -331,11 +335,9 @@ def deconvolve_color(
     img_bgr: np.ndarray,
     scale: float,
     psf_override: Optional[float] = None,
+    jpeg_input: bool = False,
 ) -> np.ndarray:
     """Apply Wiener deconvolution to a color image (luma channel only).
-
-    Operates entirely in float32 (no premature uint8 quantization) to
-    preserve the sub-8-bit precision gained from multi-frame stacking.
 
     Parameters
     ----------
@@ -345,6 +347,9 @@ def deconvolve_color(
         Effective upscale factor.
     psf_override : float, optional
         Override PSF sigma.
+    jpeg_input : bool
+        Pass True for JPEG-sourced images to activate JPEG-specific
+        PSF scaling and noise-floor corrections.
 
     Returns
     -------
@@ -355,7 +360,7 @@ def deconvolve_color(
     ycrcb_f32 = cv2.cvtColor(img_scaled, cv2.COLOR_BGR2YCrCb)
 
     y_scaled = ycrcb_f32[:, :, 0] * 255.0
-    y_deconv = wiener_deconv(y_scaled, scale, psf_override)
+    y_deconv = wiener_deconv(y_scaled, scale, psf_override, jpeg_input=jpeg_input)
 
     ycrcb_f32[:, :, 0] = np.clip(y_deconv, 0.0, 255.0) / 255.0
     result_scaled = cv2.cvtColor(ycrcb_f32, cv2.COLOR_YCrCb2BGR)

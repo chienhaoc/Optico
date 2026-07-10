@@ -2,8 +2,15 @@
 
 All magic numbers and empirical parameters are centralized here
 for transparency, tuning, and documentation.
+
+Cross-phase dependency map
+--------------------------
+JPEG source detection (pipeline.py Phase 0)
+  → Phase 2 alignment: JPEG_ECC_GAUSS_FILT_SIZE (suppresses DCT block edges)
+  → Phase 8 drizzle:   DRIZZLE_COVERAGE_FLOOR_RATIO (coverage-hole fill)
+  → Phase 9 deconv:    JPEG_PSF_SCALE_FACTOR, JPEG_NOISE_FLOOR_HIGH_FREQ_FRACTION
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 
@@ -23,10 +30,24 @@ ECC_EPSILON: float = 1e-6
 """Convergence threshold for ECC."""
 
 ECC_GAUSS_FILT_SIZE: int = 5
-"""Gaussian filter kernel size for ECC input smoothing."""
+"""Gaussian filter kernel size for ECC input smoothing (RAW / PNG input)."""
+
+JPEG_ECC_GAUSS_FILT_SIZE: int = 7
+"""Gaussian filter kernel size for JPEG input.
+
+JPEG 8×8 DCT blocks introduce high-frequency inter-block discontinuities
+that ECC can lock onto as false sub-pixel offsets.  A larger smoothing
+kernel (7 vs 5) suppresses these block-edge artifacts so ECC converges
+to the true optical displacement rather than the DCT quantisation grid.
+
+Relation to Phase 8 / 9: cleaner sub-pixel offsets directly improve
+dither N_eff (Phase 5) and therefore the preflight blur_limit (Phase 7),
+which in turn determines whether the grid-artifact fix in drizzle.py
+needs to work harder.
+"""
 
 # ============================================================
-# Dynamic Masking (Phase 3)
+# Dynamic Masking (Phase 6)
 # ============================================================
 NOISE_MODEL_GAIN: float = 0.5
 """Poisson-Gaussian noise model gain coefficient (a in sigma = sqrt(aI + b))."""
@@ -56,7 +77,7 @@ MASK_BLUR_KSIZE: int = 5
 """Gaussian blur kernel size for mask edge smoothing."""
 
 # ============================================================
-# Pre-flight Scale Bounding (Phase 2b)
+# Pre-flight Scale Bounding (Phase 7)
 # ============================================================
 OPTICAL_DECAY_CONSTANT: float = 0.75
 """Maps dimensionless alignment SNR to spatial scale factor.
@@ -72,7 +93,7 @@ MIN_RETAINED_RATIO: float = 0.05
 """Floor for retained ratio to avoid division by zero in blur_limit."""
 
 # ============================================================
-# Drizzle Stacking (Phase 4)
+# Drizzle Stacking (Phase 8)
 # ============================================================
 DEFAULT_PIXFRAC: float = 0.7
 """Pixel fraction (droplet shrink factor) for Drizzle.
@@ -84,6 +105,48 @@ DEFAULT_NUM_CHUNKS: int = 8
 DRIZZLE_WEIGHT_FLOOR: float = 1e-6
 """Minimum weight to avoid division by zero in Drizzle normalization."""
 
+DRIZZLE_COVERAGE_FLOOR_RATIO: float = 0.35
+"""HR pixels whose accumulated denominator falls below this fraction of the
+chunk-median denominator are flagged as coverage holes and filled by a fast
+3×3 Gaussian-weighted average of surrounding pixels before normalisation.
+
+Root cause addressed
+---------------------
+The backward 4-neighbour overlap calculation in _drizzle_chunk_vectorized()
+has a structural blind spot: when the nearest LR pixel centre projects to a
+position > r_droplet away from an HR pixel centre (which occurs at specific
+sub-pixel offset phases), the overlap integral is zero for that LR pixel,
+and the coverage-gap may persist across all N frames if their sub-pixel
+offsets cluster in the same region.  This manifests as a grid-like
+bright/dark pattern in the output (the HR pixel is normalised by a very
+small denominator, amplifying numerical noise).
+
+Fix strategy
+------------
+Rather than rewriting the chunked drizzle as a true forward-projection
+(which would break the memory-bounded chunk architecture), we apply a
+post-accumulation coverage-hole fill inside each chunk:
+
+  1. Compute chunk-median of the denominator array.
+  2. Build a boolean hole mask: denominator < threshold * median.
+  3. Fill hole pixels from a 3×3 Gaussian-blurred version of the
+     denominator and numerator arrays (scipy.ndimage.uniform_filter
+     approximation for speed).  This is equivalent to bilinear
+     interpolation from surrounding well-covered pixels.
+  4. Continue with normal per-pixel normalisation.
+
+Effect on resolution: the fill only activates for pixels that would
+otherwise contain near-zero or zero signal.  Well-covered pixels are
+not modified.  Spatial resolution is therefore preserved for the
+majority of the image; only the artefact grid lines are smoothed.
+
+Cross-phase note: the grid artefact is more visible at lower scales
+(scale ≈ 1.6) because fewer LR pixels contribute per HR pixel.  At
+higher scales (≥ 2.0) natural overlap from multiple frames fills the
+gaps without intervention.  Setting this ratio to 0.0 disables the
+fix entirely.
+"""
+
 # ============================================================
 # Wiener Deconvolution (Phase 9)
 # ============================================================
@@ -93,49 +156,82 @@ Equals 1 / Phi_inv(3/4) where Phi is the standard normal CDF."""
 
 K_EST_MIN: float = 0.001
 """Retained for backward compatibility / diagnostic logging only.
-No longer used to derive the Wiener regularization parameter directly—
-see NOISE_FLOOR_HIGH_FREQ_FRACTION below."""
+No longer used to derive the Wiener regularization parameter directly."""
 
 K_EST_MAX: float = 0.08
 """Retained for backward compatibility / diagnostic logging only."""
 
 NOISE_FLOOR_HIGH_FREQ_FRACTION: float = 0.75
-"""Lower bound of the radial frequency search range (as a fraction of the
-Nyquist radius) used by _find_noise_plateau() to locate the frequency
-annulus where the image power spectrum has decayed to its white-noise
-floor. The actual cutoff is found adaptively; this is the minimum
-frequency considered, not a fixed boundary.
-Chosen so the search starts well into the noise-dominated region for
-typical camera images while leaving headroom for high-resolution
-Drizzle outputs where signal may extend slightly further."""
+"""Lower bound of the radial frequency search range (fraction of Nyquist)
+used by _find_noise_plateau() for RAW / PNG input."""
+
+JPEG_NOISE_FLOOR_HIGH_FREQ_FRACTION: float = 0.60
+"""Lower bound of the noise-plateau radial frequency scan for JPEG input.
+
+JPEG DCT quantisation creates a hard spectral cutoff at approximately
+0.55–0.65 × Nyquist (quality-dependent).  Above that cutoff the power
+spectrum is dominated by quantisation noise rather than image signal,
+so it looks identical to a white-noise plateau.  If the plateau scan
+starts at the default 0.75 × Nyquist, _find_noise_plateau() anchors
+its noise floor estimate inside this JPEG-artifact band, inflating N_floor
+by 2–5× and consequently over-regularising K(f) across the entire
+spectrum — manifesting as loss of sharpness and texture detail.
+
+By starting the scan at 0.60 × Nyquist (just above the typical JPEG
+cutoff), the detector finds the genuine white-noise floor and produces
+a conservative, accurate K(f) map that preserves high-frequency detail.
+
+Cross-phase note: this constant works in tandem with JPEG_PSF_SCALE_FACTOR.
+The PSF fix compensates for JPEG quantisation blur in the spatial domain;
+this constant fixes the frequency-domain noise estimation.  Both are needed
+for full sharpness recovery on JPEG inputs.
+"""
+
+JPEG_PSF_SCALE_FACTOR: float = 1.35
+"""Multiplicative factor applied to psf_sigma when the input is JPEG.
+
+Physical basis
+--------------
+A JPEG-compressed image has already been blurred by two PSFs before
+Optico processes it:
+
+  1. Optical PSF of the lens (modelled by PSF_SIGMA_SCALE * scale).
+  2. JPEG quantisation PSF: the DCT re-synthesis after coefficient
+     truncation is equivalent to low-pass filtering with a kernel whose
+     effective sigma is roughly 0.3–0.5 px (quality 85–95).
+
+The composite effective PSF sigma is:
+  sigma_eff = sqrt(sigma_optical² + sigma_jpeg²)
+            ≈ sigma_optical * sqrt(1 + (sigma_jpeg/sigma_optical)²)
+
+For typical sigma_optical ≈ 0.65 and sigma_jpeg ≈ 0.40:
+  sigma_eff ≈ 0.65 * sqrt(1 + 0.38) ≈ 0.65 * 1.174 ≈ 0.76
+
+A flat factor of 1.35 is a conservative upper-bound that avoids
+under-correcting (which leaves JPEG blur visible) without
+over-correcting (which would introduce ringing).
+
+Cross-phase note: the ECC Gaussian filter size is also enlarged for JPEG
+input (JPEG_ECC_GAUSS_FILT_SIZE).  That upstream fix improves sub-pixel
+offset accuracy, which reduces the effective alignment PSF contribution;
+this constant handles the remaining quantisation-domain blur.
+"""
 
 NOISE_PLATEAU_BINS: int = 20
-"""Number of radial frequency bins used by _find_noise_plateau() to
-search for the onset of the noise plateau. More bins = finer resolution
-but slower; 20 is a good balance for images up to ~8k px."""
+"""Number of radial frequency bins for _find_noise_plateau()."""
 
 NOISE_PLATEAU_GRAD_THRESHOLD: float = 0.05
-"""Relative gradient threshold for plateau detection: a bin is considered
-part of the flat noise floor when its change in median power is less than
-this fraction of the DC-region power. Lower = finds plateau earlier
-(more aggressive noise suppression); higher = more conservative."""
+"""Relative gradient threshold for noise plateau detection."""
 
 MIN_SIGNAL_POWER_FRACTION: float = 0.005
 """Floor on estimated per-frequency signal power, as a fraction of the
-noise floor, to avoid division-by-zero / unbounded K at frequencies
-where measured power dips below the noise floor (pure noise bins)."""
+noise floor, to avoid division-by-zero / unbounded K."""
 
 K_FREQ_MIN: float = 1e-4
-"""Lower clip bound for the per-frequency regularization K(f).
-Prevents Wiener filter from acting as a pure inverse filter at any
-frequency, which would amplify noise catastrophically."""
+"""Lower clip bound for per-frequency regularization K(f)."""
 
 K_FREQ_MAX: float = 200.0
-"""Upper clip bound for the per-frequency regularization K(f).
-At K=200 the Wiener response is 1/(1+200) ≈ 0.5%, effectively
-suppressing those frequencies to near-zero. Generous rather than tight
-because DC-gain preservation (not K clamping) is the operative
-brightness-safety mechanism."""
+"""Upper clip bound for per-frequency regularization K(f)."""
 
 PSF_SIGMA_MIN: float = 0.6
 """Minimum PSF sigma (tightest optical limit)."""
@@ -153,6 +249,12 @@ class OpticoConfig:
 
     All parameters have sensible defaults based on optical physics.
     Override individual fields to tune behavior for specific scenes.
+
+    JPEG vs RAW auto-detection
+    --------------------------
+    When jpeg_input is None (default), pipeline.py Phase 0 auto-detects
+    the source format by inspecting file headers.  Set jpeg_input=True
+    or jpeg_input=False to override the detection result.
     """
     # Alignment
     align_scale: float = DEFAULT_ALIGN_SCALE
@@ -179,3 +281,6 @@ class OpticoConfig:
     # Deconvolution
     psf_override: Optional[float] = None
     skip_deconv: bool = False
+
+    # Input source (auto-detected by pipeline.py; override if needed)
+    jpeg_input: Optional[bool] = None
