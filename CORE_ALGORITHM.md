@@ -4,7 +4,21 @@ This document details the mathematical models, formulations, and exact algorithm
 
 ---
 
-## 1. Sub-pixel Registration & Dither circular statistics (`alignment.py`)
+## 0. JPEG vs RAW Source Detection (`pipeline.py`)
+
+Before any processing begins, Optico auto-detects whether the burst images are JPEG-sourced by reading the first 2 bytes of each file and checking for the JPEG SOI marker (`0xFF 0xD8`). The result is stored in `config.jpeg_input` and propagates downstream to three phases:
+
+| Phase | RAW / PNG | JPEG |
+|---|---|---|
+| Phase 2 — ECC alignment | `gauss_filt_size = 5` | `gauss_filt_size = 7` |
+| Phase 8 — Drizzle | coverage-hole fill (universal) | same |
+| Phase 9 — Deconvolution | PSF σ = `0.4·S`, HF fraction = 0.75 | PSF σ ×1.35, HF fraction = 0.60 |
+
+The detection can be overridden via `config.jpeg_input = True/False` or the CLI flags `--jpeg` / `--raw`.
+
+---
+
+## 1. Sub-pixel Registration & Dither Quality (`alignment.py`)
 
 ### Sub-pixel Translation Mapping
 For burst photography (either handheld or tripod-mounted bursts), camera motion is modeled purely as rigid translation to prevent overfitting to high-frequency noise. Each target frame $I_i$ is mapped to the reference frame $I_{ref}$ by solving:
@@ -12,111 +26,115 @@ $$E(M_i) = \max \text{ECC}(I_{ref}, I_i(M_i))$$
 where the transformation matrix is:
 $$M_i = \begin{bmatrix} 1 & 0 & t_{x,i} \\ 0 & 1 & t_{y,i} \end{bmatrix}$$
 To speed up convergence and stabilize registration against high-frequency noise, registration is solved on downscaled frames (scale factor $\gamma = 0.5$). The resolved translations are then rescaled back to the original resolution:
-$$t_{x,\text{original}} = \frac{t_{x,\text{downscaled}}}{\gamma}$$
-$$t_{y,\text{original}} = \frac{t_{y,\text{downscaled}}}{\gamma}$$
+$$t_{x,\text{original}} = \frac{t_{x,\text{downscaled}}}{\gamma}, \quad t_{y,\text{original}} = \frac{t_{y,\text{downscaled}}}{\gamma}$$
 
-### 2D Torus Resultant Vector Length (Dither Quality)
-To achieve sub-pixel super-resolution, sub-pixel displacements must cover the unit pixel area uniformly. Optico models this using 2D circular statistics on the unit torus.
+**JPEG note:** JPEG 8×8 DCT blocks introduce inter-block discontinuities that ECC can lock onto as false sub-pixel offsets. For JPEG input the pre-smoothing Gaussian filter is enlarged from 5 → 7 px (`JPEG_ECC_GAUSS_FILT_SIZE`) to suppress these block-edge artifacts before ECC runs.
 
-For valid translation offsets, we extract the sub-pixel fractional parts:
-$$f_{x,i} = t_{x,i} - \lfloor t_{x,i} \rfloor, \quad f_{y,i} = t_{y,i} - \lfloor t_{y,i} \rfloor$$
-These are mapped to phase angles:
-$$\theta_{x,i} = 2\pi f_{x,i}, \quad \theta_{y,i} = 2\pi f_{y,i}$$
-The axis-wise mean resultant vector lengths are:
-$$R_x = \sqrt{\left(\frac{1}{N}\sum_{i=1}^N \cos\theta_{x,i}\right)^2 + \left(\frac{1}{N}\sum_{i=1}^N \sin\theta_{x,i}\right)^2}$$
-$$R_y = \sqrt{\left(\frac{1}{N}\sum_{i=1}^N \cos\theta_{y,i}\right)^2 + \left(\frac{1}{N}\sum_{i=1}^N \sin\theta_{y,i}\right)^2}$$
-To preserve the coordinate correlation, the joint 2D resultant vector length is defined as:
-$$R_{2D} = \sqrt{R_x \cdot R_y}$$
-### Small-sample bias correction
+### N_eff Entropy Dither Quality
+Sub-pixel offsets must cover the unit pixel uniformly. Optico quantifies coverage via Shannon entropy on a 4×4 sub-pixel histogram:
+$$H = -\sum_{k} p_k \log_2 p_k$$
+$$N_{\text{eff}} = 2^H \in [1.0,\ 16.0]$$
+Higher $N_{\text{eff}}$ means more independent sub-pixel positions; the pre-flight scale cap uses $\sqrt{N_{\text{eff}}}$ as the dither contribution.
 
-The raw $R_{2D}$ is a *biased* estimator of true phase concentration when $N$ is small: even for perfectly uniform random phases, sampling noise alone gives $R_{2D}$ a non-zero expected value. Under the null hypothesis of uniform circular data, the classical circular-statistics result (Fisher 1993, *Statistical Analysis of Circular Data*; Mardia & Jupp 1999, *Directional Statistics*) gives the per-axis Rayleigh statistic $N \cdot R_x^2$ as asymptotically $\text{Exponential}(\text{mean}=1)$, hence the closed-form null expectation:
-$$E[R_x^2] = \frac{1}{N}, \quad E[R_x] = \frac{\sqrt{\pi}}{2\sqrt{N}}$$
-Assuming independent x/y sub-pixel phases, the joint statistic's null expectation is:
-$$E[R_{2D}^2] = E[R_x]\cdot E[R_y] = \frac{\pi}{4N}$$
-(Verified with a 500k-trial Monte-Carlo sweep over $N=4..50$: the empirical ratio converges to $\pi/4 \approx 0.7854$, within 2% even at $N=5$.) The correction is applied entirely in $R$-space (correcting $R^2$ first, converting to $Q$ only at the end) to avoid mixing an $R$-scale noise floor into the inversely-scaled $Q$:
-$$R_{2D,\text{corr}} = \sqrt{\max\left(0,\; R_{2D}^2 - \frac{\pi}{4N}\right)}, \qquad Q_{\text{dither}} = 1 - R_{2D,\text{corr}} \in [0.0, 1.0]$$
-When the observed concentration is statistically indistinguishable from pure chance, $Q_{\text{dither}}$ is treated as $1.0$ rather than penalized for insufficient sample size.
+> **Historical note:** earlier versions used a 2D Rayleigh resultant with small-sample bias correction ($\pi/4N$ floor). That approach saturated $Q = 1.0$ in 6/8 test distributions, effectively disabling the pre-flight branch. The $N_{\text{eff}}$ entropy metric is numerically stable and physically interpretable.
 
 ### Harmony Anchor (Geometric Median Selection)
-To avoid outlier reference selection (e.g. choosing a frame skewed by massive camera shake), the reference frame is chosen by solving the geometric median of the translation coordinates:
-$$\mathbf{t}_{\text{median}} = \arg\min_{\mathbf{x} \in \mathbb{R}^2} \sum_{i=1}^N \|\mathbf{t}_i - \mathbf{x}\|_2$$
-We solve this using Weiszfeld's iterative algorithm:
-$$\mathbf{x}^{(k+1)} = \frac{\sum_{i=1}^N \frac{\mathbf{t}_i}{\|\mathbf{t}_i - \mathbf{x}^{(k)}\|_2}}{\sum_{i=1}^N \frac{1}{\|\mathbf{t}_i - \mathbf{x}^{(k)}\|_2}}$$
-After locating $\mathbf{t}_{\text{median}}$, candidate frames within the $50\text{th}$ percentile of distance to the median are collected. Among these, the frame with the highest Laplacian variance is chosen as the reference:
-$$\text{Sharpness}(I) = \text{Var}(\text{Laplacian}(I))$$
+The reference frame is chosen by solving the geometric median of translation coordinates:
+$$\mathbf{t}_{\text{median}} = \arg\min_{\mathbf{x}} \sum_{i=1}^N \|\mathbf{t}_i - \mathbf{x}\|_2$$
+Solved via Weiszfeld's algorithm. The sharpest frame within the 50th-percentile distance to the median is selected:
+$$\text{Sharpness}(I) = \text{Var}(\nabla^2 I)$$
 
 ---
 
 ## 2. Dynamic Foreground Masking (`masking.py`)
 
 To prevent ghosting artifacts, we compute a normalized difference mask.
-We model sensor noise locally using a Poisson-Gaussian model:
-$$\sigma_{\text{noise}}(x,y) = \sqrt{a \cdot I_{\text{ref}}(x,y) + b}$$
-where $a = 0.5$ represents the photon noise gain, and $b = 1.0$ represents read/system noise.
-To prevent false-positive motion detection at high-frequency edges due to sub-pixel interpolation errors, we include the gradient magnitude in the denominator:
-$$\text{denom}(x,y) = \sigma_{\text{noise}}(x,y) + c \cdot \|\nabla I_{\text{ref}}(x,y)\|_2 + 1.0$$
-where $c = 0.3$. The normalized absolute difference for frame $i$ is:
+Sensor noise is modeled locally using a Poisson-Gaussian model:
+$$\sigma_{\text{noise}}(x,y) = \sqrt{a \cdot I_{\text{ref}}(x,y) + b}, \quad a=0.5,\ b=1.0$$
+Gradient magnitude is included in the denominator to suppress false positives at sub-pixel edges:
+$$\text{denom}(x,y) = \sigma_{\text{noise}}(x,y) + 0.3 \cdot \|\nabla I_{\text{ref}}(x,y)\|_2 + 1.0$$
 $$D_{\text{norm}, i}(x,y) = \frac{|I_{i,\text{warped}}(x,y) - I_{\text{ref}}(x,y)|}{\text{denom}(x,y)}$$
-Dual-thresholding is applied:
-* Background motion: $D_{\text{norm}, i} > 1.5$ (dilated with a $7\times7$ kernel)
-* Subject motion: $D_{\text{norm}, i} > 3.0$ (dilated with an $11\times11$ kernel, 2 iterations)
-A soft weight map $W_i(x,y) \in [0, 1]$ is produced by Gaussian smoothing the combined binary motion mask.
+Dual-thresholding:
+- Background motion: $D_{\text{norm}} > 1.5$ (7×7 dilation)
+- Subject motion: $D_{\text{norm}} > 3.0$ (11×11 dilation, 2 iterations)
+
+A soft weight map $W_i(x,y) \in [0, 1]$ is produced by Gaussian-smoothing the combined binary mask.
 
 ---
 
 ## 3. Pre-flight Scale Bounding (`preflight.py`)
 
-The theoretical resolution limit of the Drizzle stack is bounded by two physical constraints:
-1. **Sampling Density Limit**: Based on the spatial sampling theorem, the density of clean, non-moving spatial data bounds the resolution. The density limit is:
+The theoretical resolution limit is bounded by two physical constraints:
+1. **Sampling Density Limit:**
    $$S_{\text{density}} = \sqrt{N \cdot R_{\text{global}}}$$
-2. **Alignment Blur Limit (CRLB)**: Registration errors and concentrated sub-pixel coverage introduce alignment drift variance $\sigma_{\text{align}}^2 \propto \frac{1 - Q_{\text{dither}}}{Q_{\text{dither}}}$. Based on the Cramer-Rao Lower Bound (CRLB) of sub-pixel phase reconstruction, to prevent alignment drift blur, the upscale factor is capped by:
-   $$S_{\text{blur}} = \alpha \sqrt{\frac{Q_{\text{dither}}}{1 - Q_{\text{dither}}}}$$
-   where $Q_{\text{dither}}$ is the sub-pixel dither quality, and $\alpha = 0.75$ is the optical decay constant.
+2. **Alignment Blur Limit (CRLB):** using $N_{\text{eff}}$ as the dither quality measure:
+   $$S_{\text{blur}} = \alpha \cdot \sqrt{N_{\text{eff}}}$$
+   where $\alpha = 0.75$ is the optical decay constant.
 
-The final scale factor is bounded dynamically:
-$$S_{\text{final}} = \min(S_{\text{target}}, S_{\text{density}}, S_{\text{blur}})$$
+The final scale factor is:
+$$S_{\text{final}} = \min(S_{\text{target}},\ S_{\text{density}},\ S_{\text{blur}})$$
 
 ---
 
 ## 4. Vectorized Drizzle Stacking (`drizzle.py`)
 
-Optico implements Variable-Pixel Linear Reconstruction (Drizzle) by mapping each input pixel onto the high-resolution grid.
-To optimize performance, Optico projects the entire grid using a vectorized affine warp:
+Optico implements Variable-Pixel Linear Reconstruction (Fruchter & Hook 2002) adapted for handheld burst photography.
+
+Each LR pixel is projected onto the HR grid via:
 $$x_{\text{HR}} = S \cdot (x_{\text{LR}} - t_x), \quad y_{\text{HR}} = S \cdot (y_{\text{LR}} - t_y)$$
-The shrunken pixel footprint is modeled using the pixel fraction factor $p = \text{pixfrac} \in [0.0, 1.0]$. The droplet area scales the warped mask weight:
-$$W_{\text{drizzle}, i} = W_i \cdot p^2$$
-For each horizontal chunk (strip), the high-resolution canvas is accumulated:
-$$\text{Num}(x,y) = \sum_{i=1}^N W_{\text{drizzle}, i}(x,y) \cdot I_{i,\text{warped}}(x,y)$$
-$$\text{Den}(x,y) = \sum_{i=1}^N W_{\text{drizzle}, i}(x,y)$$
-The final normalized chunk pixel value is:
-$$I_{\text{HR}}(x,y) = \frac{\text{Num}(x,y)}{\max(\text{Den}(x,y), 10^{-6})}$$
+
+The droplet radius is:
+$$r_{\text{drop}} = \frac{p \cdot S}{2}, \quad p = \text{pixfrac} \in [0,1]$$
+
+Per-chunk accumulation:
+$$\text{Num}(x,y) = \sum_{i=1}^N \text{overlap}_i(x,y) \cdot W_i(x,y) \cdot I_i(x,y)$$
+$$\text{Den}(x,y) = \sum_{i=1}^N \text{overlap}_i(x,y) \cdot W_i(x,y)$$
+$$I_{\text{HR}}(x,y) = \frac{\text{Num}(x,y)}{\max(\text{Den}(x,y),\ 10^{-6})}$$
+
+### Coverage-Hole Fill
+
+The backward 4-neighbour overlap kernel has a structural blind spot: when the nearest LR pixel centre projects to a position $> r_{\text{drop}}$ away from an HR pixel centre, overlap = 0. If all frames share similar sub-pixel offsets this creates a periodic grid of under-covered HR pixels, producing visible bright/dark grid artifacts.
+
+**Fix:** After accumulation and before normalisation, HR pixels where
+$$\text{Den}(x,y) < \tau \cdot \text{median}(\text{Den})$$
+are flagged as coverage holes ($\tau = 0.35$). Their numerator and denominator are replaced by a 3×3 Gaussian-weighted neighbourhood average:
+$$\text{Den}_{\text{filled}}(x,y) = (\text{uniform\_filter}_{3\times3} * \text{Den})(x,y)$$
+This is equivalent to bilinear interpolation from surrounding well-covered pixels. Only hole pixels are modified; well-covered pixels are unchanged.
 
 ---
 
-## 5. Adaptive Dual-Band Wiener Deconvolution (`deconvolution.py`)
+## 5. Frequency-Dependent Wiener Deconvolution (`deconvolution.py`)
 
-### Corrected Noise MAD Formula
-The global noise floor standard deviation $\sigma_{\text{noise}}$ is estimated from the Laplacian of the image. For a discrete 3x3 Laplacian operator with kernel $K_{\Delta}$, convolving i.i.d. Gaussian noise with variance $\sigma^2$ amplifies the output variance to $\sigma_{out}^2 = \sigma^2 \sum K(u,v)^2 = 20\sigma^2$. Thus, the standard deviation is amplified by $\sqrt{20}$.
-To recover the original noise floor standard deviation $\sigma_{\text{noise}}$ from the Median Absolute Deviation (MAD) of the Laplacian image, we must scale by $1/\sqrt{20}$:
-$$\sigma_{\text{noise}} = \frac{1.4826 \cdot \text{median}(|\text{Lap}(I) - \text{median}(\text{Lap}(I))|)}{\sqrt{20}}$$
-The Wiener noise regularization parameter is:
-$$K_{\text{est}} = \text{clamp}(\sigma_{\text{noise}}^2, 0.001, 0.08)$$
+### Noise Estimation
+The global noise floor standard deviation $\sigma_{\text{noise}}$ is estimated from the Laplacian MAD:
+$$\sigma_{\text{noise}} = \frac{1.4826 \cdot \text{MAD}(\nabla^2 I)}{\sqrt{20}}$$
+The $\sqrt{20}$ factor corrects for the 3×3 Laplacian kernel's noise amplification.
 
-### Point Spread Function (PSF) Circulant Padding
-The Optical Transfer Function $H(u,v)$ is computed from the Gaussian PSF kernel:
-$$h(x,y) = \frac{1}{2\pi \sigma_{\text{PSF}}^2} \exp\left(-\frac{x^2+y^2}{2\sigma_{\text{PSF}}^2}\right)$$
-where $\sigma_{\text{PSF}} = \max(0.6, 0.4 \cdot S_{\text{final}})$.
-Instead of generating an image-sized PSF array directly, we generate a small kernel of size $2\lceil 3\sigma_{\text{PSF}} \rceil + 1$, and embed it into the corners of an empty image-sized canvas using wrap-around indices (circulant padding). This ensures that the center of the PSF aligns with $(0,0)$ when computing the FFT:
-$$H(u,v) = \mathcal{F}\{h_{\text{padded}}(x,y)\}$$
+### PSF Model
+The optical PSF is modeled as a Gaussian with:
+$$\sigma_{\text{PSF}} = \max(0.6,\ 0.4 \cdot S_{\text{final}})$$
 
-### Dual-Band Spatial Blending
-Two deconvolution regularizers are defined:
-$$K_{\text{strong}} = \max(2 \cdot K_{\text{est}}, 0.01), \quad K_{\text{weak}} = \max(6 \cdot K_{\text{est}}, 0.03)$$
-Two parallel restorations are computed in the frequency domain:
-$$\hat{F}_{\text{strong}}(u,v) = \left( \frac{H^*(u,v)}{|H(u,v)|^2 + K_{\text{strong}}} \right) G(u,v)$$
-$$\hat{F}_{\text{weak}}(u,v) = \left( \frac{H^*(u,v)}{|H(u,v)|^2 + K_{\text{weak}}} \right) G(u,v)$$
-We transform both back to the spatial domain:
-$$I_{\text{strong}}(x,y) = \mathcal{F}^{-1}\{\hat{F}_{\text{strong}}(u,v)\}, \quad I_{\text{weak}}(x,y) = \mathcal{F}^{-1}\{\hat{F}_{\text{weak}}(u,v)\}$$
-A soft Canny edge mask $M_{\text{edge}}(x,y) \in [0, 1]$ is generated. The final sharpened image is a spatial blend of the two restorations:
-$$I_{\text{final}}(x,y) = M_{\text{edge}}(x,y) \cdot I_{\text{weak}}(x,y) + (1 - M_{\text{edge}}(x,y)) \cdot I_{\text{strong}}(x,y)$$
-This keeps edges protected from ringing while fully sharpening flat texture regions.
+**JPEG correction:** JPEG quantisation adds a blur PSF ($\sigma_{\text{JPEG}} \approx 0.3\text{–}0.5\ \text{px}$) on top of the optical PSF. The composite effective sigma is:
+$$\sigma_{\text{eff}} = \sqrt{\sigma_{\text{optical}}^2 + \sigma_{\text{JPEG}}^2} \approx \sigma_{\text{optical}} \times 1.35$$
+For JPEG input, `psf_sigma` is multiplied by `JPEG_PSF_SCALE_FACTOR = 1.35`.
+
+### Frequency-Dependent Regularisation $K(f)$
+
+Rather than a scalar $K$, Optico estimates a per-frequency regularisation map from the image's own power spectrum:
+
+1. **Locate noise floor:** scan the radial power spectrum from $f_{\text{lo}} \times f_{\text{Nyquist}}$ outward. Find the plateau where the gradient of median power falls below 5% of the DC-region power. The median in that plateau annulus is $N_{\text{floor}}$.
+
+   > **JPEG fix:** For JPEG input, the scan starts at $f_{\text{lo}} = 0.60 \times f_{\text{Nyquist}}$ (`JPEG_NOISE_FLOOR_HIGH_FREQ_FRACTION`) instead of 0.75. JPEG DCT quantisation creates a hard spectral cutoff at ~0.55–0.65 × Nyquist; starting above this avoids mistaking the JPEG truncation band for the white-noise floor, which would inflate $N_{\text{floor}}$ by 2–5× and over-regularise all frequencies.
+
+2. **Per-frequency signal power:**
+   $$S(f) = \max\bigl(P(f) - N_{\text{floor}},\ N_{\text{floor}} \cdot 0.005\bigr)$$
+
+3. **Per-frequency $K$:**
+   $$K(f) = \text{clip}\!\left(\frac{N_{\text{floor}}}{S(f)},\ 10^{-4},\ 200\right)$$
+
+### Wiener Filter with DC-Gain Preservation
+$$\hat{F}(u,v) = \frac{H^*(u,v)}{|H(u,v)|^2 + K(u,v)} \cdot G(u,v)$$
+The DC bin $[0,0]$ is forced to unity gain to prevent mean-brightness shift:
+$$W_{\text{resp}}(0,0) = 1.0$$
+
+> **Why frequency-dependent $K$ outperforms dual-band Canny blending:** Natural-image power spectra fall as $\sim 1/f^2$ while sensor noise is approximately white (flat power). A scalar $K$ cannot represent both regimes simultaneously. The previous dual-band approach used Canny edge masks to proxy for this, but still applied a flat $K$ within each band. The per-frequency approach directly matches the textbook SNR-inverse Wiener solution, yielding +1.54 dB PSNR average improvement across noise levels σ = 1–9.

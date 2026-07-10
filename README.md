@@ -1,110 +1,88 @@
-# Optico 📸
+# Optico
 
-**Multi-Frame Super-Resolution (MFSR) Engine — Pure Optical Data, Authentic Reconstruction.**
+**Multi-Frame Super-Resolution (MFSR) engine for handheld burst photography.**
 
-Optico is a state-of-the-art computational photography engine designed to extract extreme high-resolution details and noise-free purity from burst photos (e.g., 4 to 8 frames, including tripod-mounted dithered bursts or handheld bursts) using strict optical physics. While modern AI upscalers are excellent for creative generation, Optico takes a different path: reconstructing genuine sub-pixel reality purely from captured optical data. Stacking tripod-mounted bursts with micro-dither patterns (such as sensor shift or subtle vibrations) provides the most ideal conditions to resolve true sub-pixel details.
-
----
-
-## 🌟 Core Architecture
-
-The Optico engine is built upon three foundational pillars of optical processing:
-
-### 1. Two-Pass Pre-flight Architecture (Optical Bounding)
-Blindly pushing high upscaling factors on frame bursts leads to catastrophic Alignment Drift Blur. Optico employs a highly advanced Pre-flight mask analysis to calculate the `Global Retained Pixel Ratio` ($R_{global}$). 
-Based on the **Spatial Sampling Theorem (Nyquist)** and **Cramer-Rao Lower Bound (CRLB)**, the engine calculates the exact Signal-to-Noise Ratio (SNR) of the image alignment, capping the maximum safe scale factor using rigorous optical limits rather than empirical guesswork.
-* **Static scenes**: Pushed to absolute density limits (e.g., 2.5x - 2.8x).
-* **Dynamic scenes**: Capped precisely (e.g., 1.3x - 1.8x) to trade resolution for pristine denoising.
-
-### 2. Adaptive Dual-Band Wiener Deconvolution
-Hardcoded sharpening is fundamentally flawed. Optico dynamically estimates the true noise floor using the corrected Laplacian Median Absolute Deviation (MAD) of the Drizzle stack. 
-It then splits the Fourier domain into dual bands and blends them in the spatial domain:
-* **Flat Regions**: Restored with aggressive energy (low K) to recover textures.
-* **Edges**: Strictly protected with conservative settings (high K) to eliminate ringing halos and grid artifacts.
-
-### 3. Active Memory Chunking
-Massive Multi-Frame Drizzle operations (e.g., stacking eight 24-Megapixel frames into a 1.5-Gigapixel canvas) typically crash personal computers via OS Swap Thrashing.
-Optico horizontally slices the target High-Resolution canvas into independent memory strips, locking peak memory usage to strictly under 3GB regardless of the target resolution.
+Optico fuses multiple frames of a burst into a single high-resolution image using sub-pixel registration, dynamic masking, Drizzle stacking, and adaptive Wiener deconvolution.
 
 ---
 
-## 🛠️ Codebase Structure
-
-Optico is fully modularized under `backend/`:
-* [__init__.py](file:///C:/Users/chchen/Optico_git/backend/__init__.py): Engine versioning and main API exports.
-* [constants.py](file:///C:/Users/chchen/Optico_git/backend/constants.py): Configuration class (`OpticoConfig`) and centralization of all optical constants.
-* [alignment.py](file:///C:/Users/chchen/Optico_git/backend/alignment.py): Sub-pixel ECC image registration, Harmony Anchor reference selection, and 2D circular statistics.
-* [masking.py](file:///C:/Users/chchen/Optico_git/backend/masking.py): Dual-threshold motion masking using a Poisson-Gaussian noise model.
-* [preflight.py](file:///C:/Users/chchen/Optico_git/backend/preflight.py): Resolution bounding based on Nyquist and CRLB limits.
-* [drizzle.py](file:///C:/Users/chchen/Optico_git/backend/drizzle.py): Vectorized Variable-Pixel Linear Reconstruction with memory chunking.
-* [deconvolution.py](file:///C:/Users/chchen/Optico_git/backend/deconvolution.py): Spatially blended edge-aware Wiener deconvolution in the frequency domain.
-* [pipeline.py](file:///C:/Users/chchen/Optico_git/backend/pipeline.py): Orchestrates the pipeline and handles the Command Line Interface (CLI).
-
----
-
-## ⚙️ Setup & Installation
-
-Optico requires Python 3.10+ and standard scientific libraries. 
-
-1. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-2. Verify installation:
-   ```bash
-   python -c "import backend; print(backend.__version__)"
-   ```
-
----
-
-## 🚀 Usage Guide
-
-### Command Line Interface (CLI)
-
-Run the end-to-end pipeline directly from the command line:
+## Quick Start
 
 ```bash
-# Basic run: process a burst folder with default settings (2.0x zoom, output to optico_output.png)
-python -m backend.pipeline --input path/to/burst_folder --output output.png
-
-# Advanced run: request 3.0x zoom, target pixfrac of 0.6, split into 12 memory chunks, with verbose logs
-python -m backend.pipeline --input path/to/burst_folder --scale 3.0 --pixfrac 0.6 --chunks 12 --verbose
-
-# Run without deconvolution sharpening
-python -m backend.pipeline --input path/to/burst_folder --no-deconv
+pip install -r requirements.txt
+python -m backend.pipeline --input ./burst --output result.png
 ```
 
-### Python API Example
+## CLI Options
 
-You can easily integrate Optico's pipeline directly into your Python computational photography workflows:
+| Flag | Default | Description |
+|---|---|---|
+| `--input` / `-i` | *(required)* | Directory of burst images |
+| `--output` / `-o` | `optico_output.png` | Output file path |
+| `--scale` / `-s` | `2.0` | Target upscale factor |
+| `--pixfrac` | `0.7` | Drizzle pixel fraction (0–1) |
+| `--chunks` | `8` | Memory chunks for Drizzle |
+| `--no-deconv` | off | Skip Wiener deconvolution |
+| `--align-scale` | auto | Override ECC downscale factor |
+| `--jpeg` | auto | Force JPEG-mode processing |
+| `--raw` | auto | Force RAW/PNG-mode processing |
+| `--no-cache` | off | Disable Drizzle cache |
+| `--cache-dir` | `~/.optico_cache` | Custom cache directory |
+| `--verbose` / `-v` | off | Debug logging |
+
+### JPEG vs RAW
+
+Optico auto-detects input format by reading file headers (JPEG SOI marker `0xFF 0xD8`). JPEG input activates three automatic adjustments:
+
+- **Phase 2 alignment:** ECC Gaussian filter enlarged 5 → 7 px to suppress 8×8 DCT inter-block edges that bias sub-pixel offset estimation.
+- **Phase 8 Drizzle:** coverage-hole fill active for all inputs.
+- **Phase 9 deconvolution:** PSF sigma ×1.35 (composite optical + JPEG quantisation blur); noise-floor scan range lowered from 0.75 → 0.60 × Nyquist to avoid JPEG spectral cutoff inflating the noise estimate.
+
+Use `--jpeg` or `--raw` to override auto-detection.
+
+---
+
+## Pipeline Phases
+
+| Phase | Module | Description |
+|---|---|---|
+| 0 | `pipeline.py` | JPEG vs RAW source detection |
+| 1 | `pipeline.py` | Load burst images |
+| 2 | `alignment.py` | Coarse ECC sub-pixel alignment |
+| 3 | `alignment.py` | Harmony Anchor reference selection |
+| 4 | `alignment.py` | Refined ECC alignment |
+| 5 | `alignment.py` | N_eff entropy dither quality |
+| 6 | `masking.py` | Dynamic foreground masking |
+| 7 | `preflight.py` | Pre-flight scale bounding |
+| 8 | `drizzle.py` | Drizzle stacking + coverage-hole fill |
+| 9 | `deconvolution.py` | Frequency-dependent Wiener deconvolution |
+| 10 | `pipeline.py` | Final output |
+
+---
+
+## Drizzle Cache
+
+Phases 2–8 are deterministic. Results are cached to `~/.optico_cache` (keyed on input file SHA-256 + config). Subsequent runs with the same burst and settings skip to Phase 9 instantly. Use `--no-cache` to force a full reprocess.
+
+---
+
+## Configuration
+
+All parameters are centralized in `backend/constants.py` via the `OpticoConfig` dataclass. Key fields:
 
 ```python
-import cv2
-from backend import OpticoConfig, run_pipeline
-
-# 1. Load burst images (BGR uint8)
-image_paths = ["frame0.png", "frame1.png", "frame2.png", "frame3.png"]
-images = [cv2.imread(p) for p in image_paths]
-
-# 2. Configure options
-config = OpticoConfig(
-    target_scale=2.5,        # Desired upscale (may be capped by Pre-flight)
-    pixfrac=0.7,             # Drizzle shrunken droplet ratio
-    num_chunks=8,            # Bounded memory chunk count
-    skip_deconv=False        # Apply Wiener sharpening
+OpticoConfig(
+    target_scale=2.0,        # upscale factor
+    pixfrac=0.7,             # drizzle droplet size
+    jpeg_input=None,         # None = auto-detect
+    psf_override=None,       # explicit PSF sigma
+    skip_deconv=False,
 )
-
-# 3. Run MFSR pipeline
-hr_result = run_pipeline(images, config=config, output_path="mfsr_result.png")
 ```
 
 ---
 
-## 🛠️ Upcoming: Dual-Track Frequency Merging
-Optico is currently evolving to support Frequency Separation:
-* **High-Frequency Track (Details)**: Generated exclusively from "Elite" frames (e.g., $cc > 0.95$) to maximize resolution limits without alignment blur.
-* **Low-Frequency Track (Noise Floor/Color)**: Generated from all available frames to flatten the noise floor, merged seamlessly via Laplacian pyramids.
+## References
 
----
-*Built for the pursuit of absolute optical truth.*
+- Fruchter & Hook (2002). *Drizzle: A Method for the Linear Reconstruction of Undersampled Images.* PASP 114.
+- Wiener, N. (1949). *Extrapolation, Interpolation, and Smoothing of Stationary Time Series.*
