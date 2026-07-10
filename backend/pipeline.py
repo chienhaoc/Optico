@@ -5,7 +5,7 @@ Orchestrates the full MFSR processing chain:
   Phase 2 : Coarse sub-pixel alignment (relative to frame 0)
   Phase 3 : Reference frame selection (Harmony Anchor)
   Phase 4 : Refined sub-pixel alignment (relative to reference frame)
-  Phase 5 : Dither quality assessment (2D circular statistics)
+  Phase 5 : Dither quality assessment (N_eff entropy metric)
   Phase 6 : Dynamic foreground masking
   Phase 7 : Pre-flight scale bounding
   Phase 8 : Drizzle multi-frame stacking
@@ -42,7 +42,7 @@ import numpy as np
 from .constants import OpticoConfig
 from .alignment import (
     align_images_ecc,
-    calculate_dither_quality_2d,
+    calculate_dither_quality_neff,
     select_reference_frame,
 )
 from .masking import calculate_dynamic_mask, calculate_retained_ratio
@@ -197,12 +197,12 @@ def run_pipeline(
         hr_image = drizzle_result["hr_image"]
         final_scale = drizzle_result["final_scale"]
         retained_ratio = drizzle_result["retained_ratio"]
-        dither_quality = drizzle_result["dither_quality"]
+        dither_neff = drizzle_result["dither_quality"]
         safe_cap = drizzle_result["safe_cap"]
         logger.info(
             "-- Phases 2-8: SKIPPED (cache hit) | "
-            "scale=%.2f retained=%.3f dither=%.3f --",
-            final_scale, retained_ratio, dither_quality,
+            "scale=%.2f retained=%.3f dither_neff=%.2f --",
+            final_scale, retained_ratio, dither_neff,
         )
     else:
         # ---- Cache MISS: run full Phases 2-8 ---- #
@@ -243,9 +243,9 @@ def run_pipeline(
             M_list = M_list_initial
 
         # -- Phase 5: Dither Quality Assessment --
-        logger.info("-- Phase 5: Dither Quality Assessment --")
-        dither_quality = calculate_dither_quality_2d(M_list)
-        logger.info("  Dither quality (2D circular stats): %.3f", dither_quality)
+        logger.info("-- Phase 5: Dither Quality Assessment (N_eff entropy) --")
+        dither_neff = calculate_dither_quality_neff(M_list)
+        logger.info("  Dither N_eff (effective sub-pixel positions): %.2f", dither_neff)
 
         # -- Phase 6: Dynamic Foreground Masking --
         logger.info("-- Phase 6: Dynamic Foreground Masking --")
@@ -262,7 +262,7 @@ def run_pipeline(
             target_scale=config.target_scale,
             num_frames=valid_count,
             retained_ratio=retained_ratio,
-            dither_quality=dither_quality,
+            dither_neff=dither_neff,
             cc_scores=cc_list,
             config=config,
         )
@@ -281,7 +281,7 @@ def run_pipeline(
                 hr_image=hr_image,
                 final_scale=final_scale,
                 retained_ratio=retained_ratio,
-                dither_quality=dither_quality,
+                dither_quality=dither_neff,
                 safe_cap=safe_cap,
                 image_paths=image_paths,
                 config=config,
@@ -317,7 +317,7 @@ def run_pipeline(
         "  Safe cap: %.2f | Retained ratio: %.3f",
         safe_cap, retained_ratio,
     )
-    logger.info("  Dither quality: %.3f", dither_quality)
+    logger.info("  Dither N_eff: %.2f", dither_neff)
     logger.info("  Total time: %.1fs", elapsed)
     logger.info("=" * 60)
 
@@ -368,8 +368,8 @@ def main() -> None:
         help="Skip Wiener deconvolution",
     )
     parser.add_argument(
-        "--align-scale", type=float, default=0.5,
-        help="Downscale factor for ECC alignment (default: 0.5)",
+        "--align-scale", type=float, default=None,
+        help="Override ECC alignment downscale factor (default: auto based on image size)",
     )
     parser.add_argument(
         "--no-cache", action="store_true",
@@ -389,7 +389,6 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    # Configure logging
     log_level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(
         level=log_level,
@@ -397,13 +396,17 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
-    config = OpticoConfig(
+    # Build config; only pass align_scale if user explicitly provided it
+    config_kwargs = dict(
         target_scale=args.scale,
         pixfrac=args.pixfrac,
         num_chunks=args.chunks,
         skip_deconv=args.no_deconv,
-        align_scale=args.align_scale,
     )
+    if args.align_scale is not None:
+        config_kwargs["align_scale"] = args.align_scale
+
+    config = OpticoConfig(**config_kwargs)
 
     cache_dir = Path(args.cache_dir) if args.cache_dir else DEFAULT_CACHE_DIR
 
