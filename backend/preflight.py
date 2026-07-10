@@ -1,9 +1,30 @@
 """Optico MFSR Engine — Phase 7: Pre-flight Scale Bounding.
 
-Calculates the Safe Scale Cap based on alignment quality metrics,
-using Spatial Sampling Theorem (Nyquist) and Cramer-Rao Lower Bound.
-This prevents Alignment Drift Blur by dynamically restricting the
-maximum upscale factor.
+Calculates the Safe Scale Cap based on alignment quality metrics.
+Prevents Alignment Drift Blur by dynamically restricting the maximum
+upscale factor to what the data physically supports.
+
+Formula revision (2025-07 audit)
+----------------------------------
+Old blur_limit formula:
+    blur_limit = decay * sqrt(Q / (1 - Q))
+where Q was the Rayleigh-based dither quality in (0, 1).
+
+This had two problems:
+1. Q was systematically biased to ~1.0 (see alignment.py docstring),
+   making blur_limit effectively infinite for all realistic bursts.
+2. The formula had no clear physical interpretation and was numerically
+   undefined at Q=1 (the most common output).
+
+New blur_limit formula:
+    blur_limit = decay * sqrt(N_eff)
+where N_eff = 2^H is the entropy-derived effective independent sub-pixel
+position count returned by calculate_dither_quality_neff() in alignment.py.
+
+Physical basis: Nyquist-Shannon sampling theorem on the sub-pixel grid.
+N_eff independent positions on a [0,1)² grid support recovering at most
+sqrt(N_eff) times the original resolution. The decay constant (0.75) is
+a conservative optical efficiency factor.
 """
 import logging
 import math
@@ -23,14 +44,26 @@ logger = logging.getLogger(__name__)
 def calculate_safe_scale_cap(
     num_frames: int,
     retained_ratio: float,
-    dither_quality: float = 1.0,
+    dither_neff: float = 1.0,
     optical_decay: float = OPTICAL_DECAY_CONSTANT,
 ) -> float:
     """Calculate the maximum safe upscale factor.
 
     Based on two independent physical limits:
-    1. Density Limit (Nyquist): max resolution based on total valid spatial samples (retained ratio).
-    2. Blur Limit (CRLB): max resolution constrained by sub-pixel dither quality (phase coverage).
+
+    1. Density Limit (Nyquist sampling):
+       sqrt(num_frames * retained_ratio)
+       Reflects how many independent spatial samples exist after masking.
+
+    2. Blur Limit (sub-pixel coverage):
+       decay * sqrt(N_eff)
+       where N_eff is the effective number of independent sub-pixel
+       positions as computed by calculate_dither_quality_neff().
+       Reflects whether the burst actually covers sub-pixel space
+       well enough to reconstruct high frequencies.
+
+    The safe cap is min(density_limit, blur_limit), clamped to
+    [MIN_SCALE, MAX_SCALE].
 
     Parameters
     ----------
@@ -38,10 +71,11 @@ def calculate_safe_scale_cap(
         Number of valid frames in the burst stack.
     retained_ratio : float
         Global Retained Pixel Ratio in [0, 1].
-    dither_quality : float
-        Sub-pixel dither quality in [0, 1]. 1.0 = perfectly uniform phase.
+    dither_neff : float
+        Effective independent sub-pixel position count from
+        calculate_dither_quality_neff(). Range: [1, _DITHER_GRID_N²].
     optical_decay : float
-        Optical decay constant mapping SNR to spatial scale.
+        Conservative optical efficiency factor (default 0.75).
 
     Returns
     -------
@@ -51,27 +85,18 @@ def calculate_safe_scale_cap(
     if num_frames < 1:
         return MIN_SCALE
 
-    # Clamp inputs to avoid singularities
-    R = max(retained_ratio, MIN_RETAINED_RATIO)
-    R = min(R, 1.0 - MIN_RETAINED_RATIO)
+    R = float(np.clip(retained_ratio, MIN_RETAINED_RATIO, 1.0 - MIN_RETAINED_RATIO))
+    N_eff = max(dither_neff, 1.0)
 
-    Q = max(dither_quality, MIN_RETAINED_RATIO)
-    Q = min(Q, 1.0 - MIN_RETAINED_RATIO)
-
-    # 1. Density limit: theoretical max from N frames with R retention (Phase 6)
     density_limit = math.sqrt(num_frames * R)
+    blur_limit = optical_decay * math.sqrt(N_eff)
 
-    # 2. Blur limit (CRLB): alignment phase coverage limits achievable resolution (Phase 5)
-    blur_limit = optical_decay * math.sqrt(Q / (1.0 - Q))
-
-    safe_cap = min(density_limit, blur_limit)
-    safe_cap = max(safe_cap, MIN_SCALE)
-    safe_cap = min(safe_cap, MAX_SCALE)
+    safe_cap = float(np.clip(min(density_limit, blur_limit), MIN_SCALE, MAX_SCALE))
 
     logger.info(
-        "Pre-flight: N=%d, R_global=%.3f, Q_dither=%.3f -> density_limit=%.2f, "
-        "blur_limit=%.2f -> safe_cap=%.2f",
-        num_frames, R, Q, density_limit, blur_limit, safe_cap,
+        "Pre-flight: N=%d, R=%.3f, N_eff=%.2f -> "
+        "density_limit=%.2f, blur_limit=%.2f -> safe_cap=%.2f",
+        num_frames, R, N_eff, density_limit, blur_limit, safe_cap,
     )
     return safe_cap
 
@@ -80,14 +105,14 @@ def resolve_final_scale(
     target_scale: float,
     num_frames: int,
     retained_ratio: float,
-    dither_quality: float = 1.0,
+    dither_neff: float = 1.0,
     cc_scores: Optional[list[float]] = None,
     config: Optional[OpticoConfig] = None,
 ) -> tuple[float, float]:
     """Resolve the final effective scale factor.
 
-    Applies Pre-flight bounding to clamp the user's target scale
-    to the physically safe maximum.
+    Applies Pre-flight bounding to clamp the user's target scale to the
+    physically safe maximum.
 
     Parameters
     ----------
@@ -97,10 +122,10 @@ def resolve_final_scale(
         Number of valid frames.
     retained_ratio : float
         From dynamic masking or CC approximation.
-    dither_quality: float
-        Dither quality in [0, 1].
+    dither_neff : float
+        N_eff from calculate_dither_quality_neff() in alignment.py.
     cc_scores : list of float, optional
-        Per-frame correlation coefficients.
+        Per-frame correlation coefficients (fallback for retained_ratio).
     config : OpticoConfig, optional
         Configuration parameters.
 
@@ -114,27 +139,23 @@ def resolve_final_scale(
     if config is None:
         config = OpticoConfig()
 
-    # If retained_ratio is near zero but we have CC scores, approximate
     if retained_ratio < MIN_RETAINED_RATIO and cc_scores:
         valid_cc = [c for c in cc_scores if c > 0]
         if valid_cc:
             retained_ratio = float(np.mean(valid_cc))
             logger.info(
-                "Using mean CC (%.4f) as retained ratio proxy",
-                retained_ratio,
+                "Using mean CC (%.4f) as retained ratio proxy", retained_ratio
             )
 
     safe_cap = calculate_safe_scale_cap(
-        num_frames, retained_ratio, dither_quality, config.optical_decay
+        num_frames, retained_ratio, dither_neff, config.optical_decay
     )
 
-    final_scale = min(target_scale, safe_cap)
-    final_scale = max(final_scale, MIN_SCALE)
+    final_scale = float(np.clip(min(target_scale, safe_cap), MIN_SCALE, MAX_SCALE))
 
     if final_scale < target_scale:
         logger.warning(
-            "Target scale %.2f clamped to %.2f by Pre-flight "
-            "(safe_cap=%.2f)",
+            "Target scale %.2f clamped to %.2f (safe_cap=%.2f)",
             target_scale, final_scale, safe_cap,
         )
     else:
