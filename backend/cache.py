@@ -12,10 +12,15 @@ The cache key is a SHA-256 hex digest computed from:
        target_scale, pixfrac, num_chunks, align_scale, max_offset,
        ecc_iterations, ecc_epsilon, ecc_gauss_filt_size,
        noise_gain, noise_offset, gradient_weight,
-       bg_threshold, subj_threshold, optical_decay
+       bg_threshold, subj_threshold, optical_decay,
+       jpeg_input, kernel_mode
 
 Fields that only affect Phase 9 (psf_override, skip_deconv) are
 excluded so that deconvolution parameter changes always hit the cache.
+
+Bug fix (2026-07): jpeg_input and kernel_mode were previously missing
+from the cache key, causing stale cache hits when switching --jpeg/--raw
+or changing DRIZZLE_KERNEL_MODE.  Both fields are now included.
 
 Cache layout
 ------------
@@ -52,7 +57,12 @@ def _sha256_file(path: Path) -> str:
 
 
 def _config_cache_fields(config: OpticoConfig) -> dict:
-    """Extract only the OpticoConfig fields that affect Phases 2-8."""
+    """Extract only the OpticoConfig fields that affect Phases 2-8.
+
+    Includes jpeg_input (affects Phase 2 ECC filter size and Phase 8
+    Drizzle kernel assumptions) and kernel_mode (Lanczos-2 vs box).
+    Both were previously omitted, causing silent stale-cache bugs.
+    """
     return {
         "target_scale": config.target_scale,
         "pixfrac": config.pixfrac,
@@ -68,6 +78,9 @@ def _config_cache_fields(config: OpticoConfig) -> dict:
         "bg_threshold": config.bg_threshold,
         "subj_threshold": config.subj_threshold,
         "optical_decay": config.optical_decay,
+        # --- fields added in 2026-07 bug fix ---
+        "jpeg_input": config.jpeg_input,   # affects ECC filter size
+        "kernel_mode": config.kernel_mode, # lanczos2 vs box
     }
 
 
@@ -82,7 +95,10 @@ def compute_cache_key(
     image_paths : list[Path]
         Sorted list of input image file paths.
     config : OpticoConfig
-        Pipeline configuration.
+        Pipeline configuration.  Must already have jpeg_input resolved
+        (i.e., Phase 0 detection complete) before calling this function,
+        otherwise jpeg_input=None will be hashed and the key will not
+        match a subsequent run where jpeg_input was auto-detected.
 
     Returns
     -------

@@ -11,7 +11,7 @@ Orchestrates the full MFSR processing chain:
   Phase 7 : Pre-flight scale bounding
   Phase 8 : Drizzle multi-frame stacking
   Phase 9 : Adaptive Wiener deconvolution
-  Phase 10: Final output
+  Phase 10: Final output + EXIF embedding
 
 Phase 0 — JPEG vs RAW detection
 --------------------------------
@@ -38,8 +38,29 @@ Cache is keyed on the SHA-256 of each input file's content plus the
 relevant OpticoConfig fields (psf_override and skip_deconv are
 excluded so deconv tweaks always hit the cache).
 
+IMPORTANT: The cache key is computed AFTER Phase 0 resolves jpeg_input
+(auto-detection or CLI flag).  This ensures the effective jpeg_input
+value (which changes ECC filter size) is always part of the key.
+Previously the key was computed before detection, so --jpeg and --raw
+could silently return a cache entry built with the wrong ECC settings.
+
 Use --no-cache to force a full reprocess even if a cache entry exists.
 Use --cache-dir to specify a custom cache location (default: ~/.optico_cache).
+
+EXIF output
+-----------
+When the output file is a JPEG, _write_exif() embeds pipeline parameters
+into two EXIF fields using piexif:
+  ImageDescription (0x010e): compact key=value string for quick inspection
+  UserComment (0x9286):       full JSON blob for programmatic reading
+
+Parameters written:
+  optico_version, frames, lr_w, lr_h, hr_w, hr_h, final_scale, safe_cap,
+  retained_ratio, dither_neff, jpeg_input, psf_sigma_hr, noise_hf_fraction,
+  edge_taper_width, pixfrac, cache_hit, processing_time_s
+
+If piexif is not installed or the output format is not JPEG, the step
+is silently skipped (no error, no data loss).
 
 psf_override unit convention
 -----------------------------
@@ -51,6 +72,7 @@ expects HR pixels.  Example: --psf-override 0.8 with --scale 2 results
 in deconvolve_color receiving psf_override=1.6 (HR pixels).
 """
 import argparse
+import json
 import logging
 import os
 import sys
@@ -65,6 +87,12 @@ from .constants import (
     OpticoConfig,
     JPEG_ECC_GAUSS_FILT_SIZE,
     ECC_GAUSS_FILT_SIZE,
+    JPEG_PSF_SCALE_FACTOR,
+    JPEG_NOISE_FLOOR_HIGH_FREQ_FRACTION,
+    NOISE_FLOOR_HIGH_FREQ_FRACTION,
+    PSF_SIGMA_MIN,
+    PSF_SIGMA_SCALE,
+    EDGE_TAPER_WIDTH,
 )
 from .alignment import (
     align_images_ecc,
@@ -83,6 +111,8 @@ from .cache import (
 )
 
 logger = logging.getLogger(__name__)
+
+OPTICO_VERSION = "1.1.0"  # bump when cache format or algorithm changes
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +230,89 @@ def load_burst_images(input_dir: str) -> tuple[list[np.ndarray], list[Path]]:
     return images, loaded_paths
 
 
+# ---------------------------------------------------------------------------
+# EXIF helper
+# ---------------------------------------------------------------------------
+
+def _write_exif(
+    output_path: str,
+    exif_params: dict,
+) -> None:
+    """Embed pipeline parameters into the output JPEG's EXIF metadata.
+
+    Writes to two EXIF fields:
+      - ImageDescription (0x010e): compact ``key=value; ...`` string
+        suitable for quick inspection in any image viewer.
+      - UserComment (0x9286): full JSON blob for programmatic reading.
+        Prefixed with the 8-byte ASCII charset header required by the
+        EXIF spec (``ASCII\x00\x00\x00``).
+
+    The function is a no-op (silent) if:
+      - piexif is not installed
+      - the output file is not a JPEG
+      - the file cannot be read/written after saving
+
+    Parameters
+    ----------
+    output_path : str
+        Path to the already-saved JPEG output file.
+    exif_params : dict
+        Dictionary of pipeline parameters to embed.  All values must be
+        JSON-serialisable.
+    """
+    suffix = Path(output_path).suffix.lower()
+    if suffix not in (".jpg", ".jpeg"):
+        return
+
+    try:
+        import piexif
+    except ImportError:
+        logger.debug("piexif not installed — skipping EXIF write")
+        return
+
+    try:
+        # Build compact description string
+        desc_parts = [
+            f"optico={exif_params.get('optico_version', '?')}",
+            f"scale={exif_params.get('final_scale', '?')}",
+            f"frames={exif_params.get('frames', '?')}",
+            f"jpeg_in={exif_params.get('jpeg_input', '?')}",
+            f"psf_hr={exif_params.get('psf_sigma_hr', '?')}",
+            f"neff={exif_params.get('dither_neff', '?')}",
+            f"retained={exif_params.get('retained_ratio', '?')}",
+            f"cache={exif_params.get('cache_hit', '?')}",
+            f"t={exif_params.get('processing_time_s', '?')}s",
+        ]
+        description = "; ".join(desc_parts)
+
+        # Full JSON blob with ASCII charset header (8 bytes) per EXIF spec
+        json_str = json.dumps(exif_params, ensure_ascii=True)
+        user_comment = b"ASCII\x00\x00\x00" + json_str.encode("ascii", errors="replace")
+
+        # Load existing EXIF or start fresh
+        try:
+            exif_dict = piexif.load(output_path)
+        except Exception:
+            exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}}
+
+        exif_dict["0th"][piexif.ImageIFD.ImageDescription] = description.encode("ascii", errors="replace")
+        exif_dict["Exif"][piexif.ExifIFD.UserComment] = user_comment
+
+        exif_bytes = piexif.dump(exif_dict)
+        piexif.insert(exif_bytes, output_path)
+
+        logger.info(
+            "EXIF written to %s (%d bytes in UserComment)",
+            output_path, len(user_comment),
+        )
+    except Exception as exc:
+        logger.warning("EXIF write failed (non-fatal): %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
+
 def run_pipeline(
     images: list[np.ndarray],
     config: Optional[OpticoConfig] = None,
@@ -217,7 +330,9 @@ def run_pipeline(
     config : OpticoConfig, optional
         Pipeline configuration. Uses defaults if None.
     output_path : str, optional
-        If provided, saves the result to this path.
+        If provided, saves the result to this path.  When the output is
+        a JPEG file, pipeline parameters are embedded into EXIF metadata
+        (requires piexif; silently skipped if not installed).
     image_paths : list[Path], optional
         File paths corresponding to `images`. Required for cache lookup
         and JPEG auto-detection.  If None, both are disabled.
@@ -249,7 +364,7 @@ def run_pipeline(
     lr_h, lr_w = images[0].shape[:2]
 
     logger.info("=" * 60)
-    logger.info("Optico MFSR Pipeline")
+    logger.info("Optico MFSR Pipeline v%s", OPTICO_VERSION)
     logger.info(
         "  Frames: %d | Resolution: %dx%d | Target scale: %.1fx",
         n, lr_w, lr_h, config.target_scale,
@@ -288,9 +403,14 @@ def run_pipeline(
 
     # ------------------------------------------------------------------ #
     # Drizzle Cache Lookup (Phases 2-8)                                   #
+    # NOTE: cache key computed AFTER Phase 0 so that the resolved        #
+    # jpeg_input value (True/False, never None) is part of the key.      #
+    # Previously computed before detection → --jpeg/--raw could silently #
+    # hit a cache entry built with the wrong ECC filter size.            #
     # ------------------------------------------------------------------ #
     drizzle_result = None
     cache_key = None
+    cache_hit = False
 
     if use_cache and image_paths is not None:
         logger.info("-- Cache: Computing cache key (hashing input files)... --")
@@ -304,6 +424,7 @@ def run_pipeline(
         retained_ratio = drizzle_result["retained_ratio"]
         dither_neff = drizzle_result["dither_quality"]
         safe_cap = drizzle_result["safe_cap"]
+        cache_hit = True
         logger.info(
             "-- Phases 2-8: SKIPPED (cache hit) | "
             "scale=%.2f retained=%.3f dither_neff=%.2f --",
@@ -394,12 +515,26 @@ def run_pipeline(
     # ------------------------------------------------------------------ #
     # Phase 9: Adaptive Wiener Deconvolution                              #
     # ------------------------------------------------------------------ #
+    # Compute the effective PSF sigma in HR pixels for EXIF logging
+    if config.psf_override is not None:
+        psf_override_hr: Optional[float] = config.psf_override * final_scale
+        psf_sigma_hr_log = round(psf_override_hr, 4)
+    else:
+        base_sigma = max(PSF_SIGMA_MIN, PSF_SIGMA_SCALE * final_scale)
+        if config.jpeg_input:
+            psf_sigma_hr_log = round(base_sigma * JPEG_PSF_SCALE_FACTOR, 4)
+        else:
+            psf_sigma_hr_log = round(base_sigma, 4)
+        psf_override_hr = None
+
+    noise_hf_fraction = (
+        JPEG_NOISE_FLOOR_HIGH_FREQ_FRACTION
+        if config.jpeg_input
+        else NOISE_FLOOR_HIGH_FREQ_FRACTION
+    )
+
     if not config.skip_deconv:
-        # psf_override is stored in LR pixels (physically meaningful unit).
-        # deconvolve_color expects HR pixels, so scale up here.
-        psf_override_hr: Optional[float] = None
         if config.psf_override is not None:
-            psf_override_hr = config.psf_override * final_scale
             logger.info(
                 "Phase 9: psf_override %.3f LR px → %.3f HR px (scale=%.2f)",
                 config.psf_override, psf_override_hr, final_scale,
@@ -423,7 +558,7 @@ def run_pipeline(
     result = np.clip(hr_image, 0, 255).astype(np.uint8)
 
     hr_h, hr_w = result.shape[:2]
-    elapsed = time.time() - t_start
+    elapsed = round(time.time() - t_start, 2)
 
     logger.info("=" * 60)
     logger.info("Pipeline complete!")
@@ -436,6 +571,7 @@ def run_pipeline(
         safe_cap, retained_ratio, config.jpeg_input,
     )
     logger.info("  Dither N_eff: %.2f", dither_neff)
+    logger.info("  PSF sigma (HR px): %.4f", psf_sigma_hr_log)
     logger.info("  Total time: %.1fs", elapsed)
     logger.info("=" * 60)
 
@@ -443,6 +579,28 @@ def run_pipeline(
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
         cv2.imwrite(output_path, result)
         logger.info("Saved result to %s", output_path)
+
+        # Embed pipeline parameters into JPEG EXIF
+        exif_params = {
+            "optico_version": OPTICO_VERSION,
+            "frames": n,
+            "lr_w": lr_w,
+            "lr_h": lr_h,
+            "hr_w": hr_w,
+            "hr_h": hr_h,
+            "final_scale": round(final_scale, 4),
+            "safe_cap": round(safe_cap, 4),
+            "retained_ratio": round(retained_ratio, 4),
+            "dither_neff": round(dither_neff, 4),
+            "jpeg_input": bool(config.jpeg_input),
+            "psf_sigma_hr": psf_sigma_hr_log,
+            "noise_hf_fraction": noise_hf_fraction,
+            "edge_taper_width": EDGE_TAPER_WIDTH,
+            "pixfrac": config.pixfrac,
+            "cache_hit": cache_hit,
+            "processing_time_s": elapsed,
+        }
+        _write_exif(output_path, exif_params)
 
     return result
 
@@ -454,7 +612,7 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python -m backend.pipeline --input ./burst --output result.png\n"
+            "  python -m backend.pipeline --input ./burst --output result.jpg\n"
             "  python -m backend.pipeline --input ./burst --scale 2.5\n"
             "  python -m backend.pipeline --input ./burst --no-deconv\n"
             "  python -m backend.pipeline --input ./burst --no-cache\n"
@@ -469,8 +627,8 @@ def main() -> None:
         help="Directory containing burst images",
     )
     parser.add_argument(
-        "--output", "-o", default="optico_output.png",
-        help="Output file path (default: optico_output.png)",
+        "--output", "-o", default="optico_output.jpg",
+        help="Output file path (default: optico_output.jpg)",
     )
     parser.add_argument(
         "--scale", "-s", type=float, default=2.0,
