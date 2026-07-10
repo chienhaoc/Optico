@@ -24,7 +24,7 @@ blur_limit evolution
   v2 adaptive decay (CC-based) + KDE N_eff:
      blur_limit ≈ 2.19 at CC=0.90  (+22%, within density_limit=2.51)
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 
@@ -52,6 +52,9 @@ BG_KERNEL_SIZE: int = 7
 
 SUBJ_KERNEL_SIZE: int = 11
 """Minimum subject dilation kernel size (px). Lower bound for adaptive sizing."""
+
+SUBJ_DILATE_ITERATIONS: int = 2
+"""Number of morphological dilation iterations for the subject-motion mask."""
 
 MASK_BLUR_KSIZE: int = 5
 """Minimum Gaussian blur kernel for mask soft-edges (px). Lower bound."""
@@ -126,22 +129,22 @@ PSF_SIGMA_MIN: float = 0.4
 
 Lowered from 0.6 to 0.4 so the linear region PSF_SIGMA_SCALE*scale starts
 at scale=1.0.  A sigma of 0.4 px corresponds to a diffraction-limited optical
-PSF at 1× upscale; values below sub-pixel sampling (0.4 px) are physically
+PSF at 1x upscale; values below sub-pixel sampling (0.4 px) are physically
 meaningless anyway, so this is also the natural physical floor.
 
 Previous value of 0.6 caused a flat plateau in sigma(scale) for scale < 1.5,
-which under-corrected blur for scale=1.0–1.5 runs.
+which under-corrected blur for scale=1.0-1.5 runs.
 """
 
 PSF_SIGMA_SCALE: float = 0.4
 PSF_TRUNCATION_SIGMAS: float = 3.0
 
 MIN_NOISE_FLOOR_ABS: float = 1.0
-"""Absolute minimum noise floor power (ADU²) for Wiener K_freq computation.
+"""Absolute minimum noise floor power (ADU^2) for Wiener K_freq computation.
 
 Prevents NaN in K_freq = noise_floor / signal_power when the input image is
-near-uniform or near-black (noise_floor ≈ 0 → signal_power ≈ 0 → 0/0).
-Value of 1.0 ADU² corresponds to sigma ≈ 1 ADU, below any real sensor noise,
+near-uniform or near-black (noise_floor ~ 0 -> signal_power ~ 0 -> 0/0).
+Value of 1.0 ADU^2 corresponds to sigma ~ 1 ADU, below any real sensor noise,
 so this floor never activates on real images and only protects edge cases.
 """
 
