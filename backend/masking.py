@@ -2,6 +2,20 @@
 
 Detects and masks regions with non-rigid motion to prevent
 alignment drift blur during Drizzle stacking.
+
+Kernel size adaptive sizing
+---------------------------
+Fixed pixel kernel sizes (BG=7, SUBJ=11, BLUR=5) are effective for
+small to medium images (≤ ~2 MP) but become negligibly small for
+high-resolution input (e.g. 6000×4000 = 24 MP).  At that resolution
+7 px = 0.17% of min_dim, which means morphological dilation barely
+expands motion masks at all.
+
+Fix: compute adaptive kernel sizes proportional to image min_dim,
+clamped to the fixed constants as a lower bound and forced to odd:
+  BG_kern   = max(BG_KERNEL_SIZE,   odd(round(min_dim * BG_KERNEL_MIN_DIM_FRAC)))
+  SUBJ_kern = max(SUBJ_KERNEL_SIZE, odd(round(min_dim * SUBJ_KERNEL_MIN_DIM_FRAC)))
+  BLUR_kern = max(MASK_BLUR_KSIZE,  odd(round(min_dim * MASK_BLUR_MIN_DIM_FRAC)))
 """
 import logging
 from typing import Optional
@@ -13,9 +27,18 @@ from .constants import (
     OpticoConfig,
     BG_KERNEL_SIZE, SUBJ_KERNEL_SIZE, SUBJ_DILATE_ITERATIONS,
     MASK_BLUR_KSIZE,
+    BG_KERNEL_MIN_DIM_FRAC, SUBJ_KERNEL_MIN_DIM_FRAC, MASK_BLUR_MIN_DIM_FRAC,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _adaptive_odd(base: int, min_dim: int, frac: float) -> int:
+    """Compute adaptive odd kernel size: max(base, round(min_dim*frac)), forced odd."""
+    sz = max(base, round(min_dim * frac))
+    if sz % 2 == 0:
+        sz += 1
+    return sz
 
 
 def calculate_dynamic_mask(
@@ -49,11 +72,21 @@ def calculate_dynamic_mask(
     if config is None:
         config = OpticoConfig()
 
-    logger.info("Calculating dynamic masks (Dual-Threshold)...")
-
     ref_img = images[ref_idx]
     ref_gray = cv2.cvtColor(ref_img, cv2.COLOR_BGR2GRAY).astype(np.float32)
     h, w = ref_gray.shape
+    min_dim = min(h, w)
+
+    # Adaptive kernel sizes: proportional to resolution, lower-bounded by constants
+    bg_kern   = _adaptive_odd(BG_KERNEL_SIZE,   min_dim, BG_KERNEL_MIN_DIM_FRAC)
+    subj_kern = _adaptive_odd(SUBJ_KERNEL_SIZE, min_dim, SUBJ_KERNEL_MIN_DIM_FRAC)
+    blur_kern = _adaptive_odd(MASK_BLUR_KSIZE,  min_dim, MASK_BLUR_MIN_DIM_FRAC)
+
+    logger.info(
+        "Calculating dynamic masks (Dual-Threshold), "
+        "img=%dx%d, kernels: BG=%d SUBJ=%d BLUR=%d",
+        w, h, bg_kern, subj_kern, blur_kern,
+    )
 
     # Gradient magnitude for edge-aware normalization
     grad_x = cv2.Sobel(ref_gray, cv2.CV_32F, 1, 0, ksize=3)
@@ -66,12 +99,11 @@ def calculate_dynamic_mask(
     )
     denom = noise_std + config.gradient_weight * grad + 1.0
 
-    # Morphological kernels
     kernel_bg = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (BG_KERNEL_SIZE, BG_KERNEL_SIZE)
+        cv2.MORPH_ELLIPSE, (bg_kern, bg_kern)
     )
     kernel_subj = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (SUBJ_KERNEL_SIZE, SUBJ_KERNEL_SIZE)
+        cv2.MORPH_ELLIPSE, (subj_kern, subj_kern)
     )
 
     weight_maps: list[np.ndarray] = []
@@ -87,11 +119,9 @@ def calculate_dynamic_mask(
             flags=cv2.WARP_INVERSE_MAP | cv2.INTER_LINEAR,
         )
 
-        # Normalized absolute difference
         diff = np.abs(warped.astype(np.float32) - ref_gray)
         norm_diff = diff / denom
 
-        # Dual-threshold motion detection
         bg_motion = (norm_diff > config.bg_threshold).astype(np.uint8)
         bg_motion = cv2.dilate(bg_motion, kernel_bg, iterations=1)
 
@@ -103,12 +133,9 @@ def calculate_dynamic_mask(
 
         total_motion = np.maximum(bg_motion, subj_motion)
 
-        # Soft mask with smooth boundaries (float32)
         mask = np.ones((h, w), dtype=np.float32)
         mask[total_motion > 0] = 0.0
-        mask = cv2.GaussianBlur(
-            mask, (MASK_BLUR_KSIZE, MASK_BLUR_KSIZE), 0
-        )
+        mask = cv2.GaussianBlur(mask, (blur_kern, blur_kern), 0)
 
         weight_maps.append(mask)
 
@@ -121,23 +148,9 @@ def calculate_dynamic_mask(
 def calculate_retained_ratio(
     weight_maps: list[np.ndarray],
 ) -> float:
-    """Calculate the Global Retained Pixel Ratio from weight maps.
-
-    This is a key metric for the Pre-flight Scale Bounding system.
-
-    Parameters
-    ----------
-    weight_maps : list of np.ndarray
-        Per-frame weight maps (float32, [0.0, 1.0]).
-
-    Returns
-    -------
-    float
-        Mean retained ratio across all frames, in [0.0, 1.0].
-    """
+    """Calculate the Global Retained Pixel Ratio from weight maps."""
     if not weight_maps:
         return 0.0
-
     ratios = [float(np.mean(w)) for w in weight_maps]
     global_ratio = float(np.mean(ratios))
     logger.info("Global Retained Pixel Ratio: %.4f", global_ratio)

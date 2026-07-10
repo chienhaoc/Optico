@@ -32,22 +32,11 @@ from typing import Optional
 # Alignment (Phase 2)
 # ============================================================
 DEFAULT_ALIGN_SCALE: float = 0.5
-"""Downscale factor for ECC alignment. Lower = faster but less precise."""
-
 DEFAULT_MAX_OFFSET: float = 20.0
-"""Maximum allowed translation offset (pixels) before rejecting a frame."""
-
 ECC_MAX_ITERATIONS: int = 200
-"""Maximum iterations for ECC convergence."""
-
 ECC_EPSILON: float = 1e-6
-"""Convergence threshold for ECC."""
-
 ECC_GAUSS_FILT_SIZE: int = 5
-"""Gaussian filter kernel size for ECC input smoothing (RAW / PNG input)."""
-
 JPEG_ECC_GAUSS_FILT_SIZE: int = 7
-"""Gaussian filter kernel size for JPEG input."""
 
 # ============================================================
 # Dynamic Masking (Phase 6)
@@ -57,29 +46,33 @@ NOISE_MODEL_OFFSET: float = 1.0
 GRADIENT_WEIGHT: float = 0.3
 BG_MOTION_THRESHOLD: float = 1.5
 SUBJ_MOTION_THRESHOLD: float = 3.0
+
 BG_KERNEL_SIZE: int = 7
+"""Minimum BG dilation kernel size (px). Used as lower bound for adaptive sizing."""
+
 SUBJ_KERNEL_SIZE: int = 11
-SUBJ_DILATE_ITERATIONS: int = 2
+"""Minimum subject dilation kernel size (px). Lower bound for adaptive sizing."""
+
 MASK_BLUR_KSIZE: int = 5
+"""Minimum Gaussian blur kernel for mask soft-edges (px). Lower bound."""
+
+BG_KERNEL_MIN_DIM_FRAC: float = 0.002
+"""Adaptive BG kernel: max(BG_KERNEL_SIZE, round(min_dim * frac)), forced odd."""
+
+SUBJ_KERNEL_MIN_DIM_FRAC: float = 0.004
+"""Adaptive subject kernel: max(SUBJ_KERNEL_SIZE, round(min_dim * frac))."""
+
+MASK_BLUR_MIN_DIM_FRAC: float = 0.001
+"""Adaptive mask blur: max(MASK_BLUR_KSIZE, round(min_dim * frac)), forced odd."""
 
 # ============================================================
 # Pre-flight Scale Bounding (Phase 7)
 # ============================================================
 OPTICAL_DECAY_CONSTANT: float = 0.75
-"""Conservative optical efficiency factor (lower bound / fallback).
-
-Physical basis: sub-pixel offset uncertainty budget from ECC alignment.
-Used as a lower bound; replaced by adaptive decay when CC scores are
-available (see OPTICAL_DECAY_MAX).
-"""
+"""Conservative optical efficiency factor (lower bound / fallback)."""
 
 OPTICAL_DECAY_MAX: float = 0.90
-"""Upper bound for adaptive optical decay.
-
-At high alignment quality (mean CC ≈ 0.98), alignment error is small
-enough that a decay of 0.90 does not over-extend the blur_limit beyond
-what the Wiener deconvolution (Phase 9) can recover.
-"""
+"""Upper bound for adaptive optical decay at high CC quality."""
 
 OPTICAL_DECAY_CC_LOW: float = 0.70
 """CC floor below which adaptive decay is clamped to OPTICAL_DECAY_CONSTANT."""
@@ -88,16 +81,8 @@ OPTICAL_DECAY_CC_HIGH: float = 0.98
 """CC ceiling at which adaptive decay reaches OPTICAL_DECAY_MAX."""
 
 NEFF_KDE_GRID: int = 32
-"""Evaluation grid size (per axis) for KDE-based N_eff computation.
-Used in alignment.py calculate_dither_quality_neff() KDE branch."""
-
 NEFF_KDE_BW: float = 0.12
-"""Gaussian KDE bandwidth in sub-pixel [0,1) units.
-Controls smoothing of the sub-pixel density estimate."""
-
 NEFF_KDE_MIN_FRAMES: int = 4
-"""Minimum number of valid frames required to use KDE N_eff.
-For n < NEFF_KDE_MIN_FRAMES, falls back to 4×4 histogram."""
 
 MIN_SCALE: float = 1.0
 MAX_SCALE: float = 4.0
@@ -111,19 +96,10 @@ DEFAULT_NUM_CHUNKS: int = 8
 DRIZZLE_WEIGHT_FLOOR: float = 1e-6
 
 DRIZZLE_KERNEL_MODE: str = 'lanczos2'
-"""Default Drizzle interpolation kernel.
-
-'lanczos2': Lanczos-2 kernel, radius=2 LR pixels.
-  Sandbox: CV=0.041, holes=0.00%  vs  box: CV=0.133, holes=0.39%
-
-'box': original box-overlap 4-neighbour backward drizzle (diagnostic only).
-"""
+"""Default Drizzle kernel. 'box' for diagnostic comparison."""
 
 DRIZZLE_LANCZOS_A: int = 2
-"""Lanczos kernel order (radius in LR pixel units)."""
-
 DRIZZLE_COVERAGE_FLOOR_RATIO: float = 0.15
-"""Safety-net fill threshold (lowered from 0.35; Lanczos rarely triggers)."""
 
 # ============================================================
 # Wiener Deconvolution (Phase 9)
@@ -144,40 +120,55 @@ NOISE_PLATEAU_GRAD_THRESHOLD: float = 0.05
 MIN_SIGNAL_POWER_FRACTION: float = 0.005
 K_FREQ_MIN: float = 1e-4
 K_FREQ_MAX: float = 200.0
-PSF_SIGMA_MIN: float = 0.6
+
+PSF_SIGMA_MIN: float = 0.4
+"""Minimum PSF sigma (px).
+
+Lowered from 0.6 to 0.4 so the linear region PSF_SIGMA_SCALE*scale starts
+at scale=1.0.  A sigma of 0.4 px corresponds to a diffraction-limited optical
+PSF at 1× upscale; values below sub-pixel sampling (0.4 px) are physically
+meaningless anyway, so this is also the natural physical floor.
+
+Previous value of 0.6 caused a flat plateau in sigma(scale) for scale < 1.5,
+which under-corrected blur for scale=1.0–1.5 runs.
+"""
+
 PSF_SIGMA_SCALE: float = 0.4
 PSF_TRUNCATION_SIGMAS: float = 3.0
+
+MIN_NOISE_FLOOR_ABS: float = 1.0
+"""Absolute minimum noise floor power (ADU²) for Wiener K_freq computation.
+
+Prevents NaN in K_freq = noise_floor / signal_power when the input image is
+near-uniform or near-black (noise_floor ≈ 0 → signal_power ≈ 0 → 0/0).
+Value of 1.0 ADU² corresponds to sigma ≈ 1 ADU, below any real sensor noise,
+so this floor never activates on real images and only protects edge cases.
+"""
 
 
 @dataclass
 class OpticoConfig:
     """Runtime configuration for the Optico pipeline."""
-    # Alignment
     align_scale: float = DEFAULT_ALIGN_SCALE
     max_offset: float = DEFAULT_MAX_OFFSET
     ecc_iterations: int = ECC_MAX_ITERATIONS
     ecc_epsilon: float = ECC_EPSILON
     ecc_gauss_filt_size: int = ECC_GAUSS_FILT_SIZE
 
-    # Masking
     noise_gain: float = NOISE_MODEL_GAIN
     noise_offset: float = NOISE_MODEL_OFFSET
     gradient_weight: float = GRADIENT_WEIGHT
     bg_threshold: float = BG_MOTION_THRESHOLD
     subj_threshold: float = SUBJ_MOTION_THRESHOLD
 
-    # Pre-flight
     target_scale: float = 2.0
     optical_decay: float = OPTICAL_DECAY_CONSTANT
 
-    # Drizzle
     pixfrac: float = DEFAULT_PIXFRAC
     num_chunks: int = DEFAULT_NUM_CHUNKS
     kernel_mode: str = DRIZZLE_KERNEL_MODE
 
-    # Deconvolution
     psf_override: Optional[float] = None
     skip_deconv: bool = False
 
-    # Input source (auto-detected by pipeline.py; override if needed)
     jpeg_input: Optional[bool] = None

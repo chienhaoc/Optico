@@ -3,24 +3,21 @@
 Includes:
 - Harmony Anchor: Geometric-median based reference frame selection
 - ECC Sub-pixel Registration with adaptive scale selection
-- N_eff Entropy Dither Quality (replaces Rayleigh-based metric)
+- N_eff Entropy Dither Quality (KDE-normalized, falls back to histogram)
 
 Dither quality metric history
 ------------------------------
-Original (Rayleigh-based): saturated Q=1.0 for most realistic bursts,
-disabling the pre-flight blur_limit branch.
+Original (Rayleigh-based): saturated Q=1.0 for most realistic bursts.
 
 v2 (4×4 histogram Shannon entropy):
   N_eff = 2^H, range [1, 16].
-  Problem: for N=7 frames any coverage pattern where frames land in
-  ≥7 distinct bins returns N_eff=7.0 regardless of how clustered
-  within-bin positions are.  This systematically under-penalises
-  clustered bursts and over-penalises uniform ones near bin boundaries.
+  Ceiling effect: N=7 frames with any ≧7 distinct bins all return N_eff=7.0.
 
 v3 (current, KDE-normalized N_eff):
   Torus Gaussian KDE on 32×32 evaluation grid, mapped to [1, N] scale.
-  Correctly distinguishes within-bin clustering.
-  Falls back to 4×4 histogram for n < NEFF_KDE_MIN_FRAMES.
+  Falls back to 4×4 histogram for n < NEFF_KDE_MIN_FRAMES or if scipy
+  is unavailable.  Fallback uses histogram (not float(n)) so blur_limit
+  is never over-estimated.
 
 Sandbox results:
   clustered offsets (rng 0.3-0.6):  hist=2.94 → KDE=5.91  (+3.0)
@@ -44,34 +41,38 @@ logger = logging.getLogger(__name__)
 _DITHER_GRID_N: int = 4
 
 
+def _neff_histogram(fx: np.ndarray, fy: np.ndarray) -> float:
+    """4×4 histogram Shannon entropy N_eff."""
+    hist, _, _ = np.histogram2d(
+        fx, fy, bins=_DITHER_GRID_N,
+        range=[[0.0, 1.0], [0.0, 1.0]],
+    )
+    hist = hist / max(hist.sum(), 1e-9)
+    nonzero = hist[hist > 0]
+    H = float(-np.sum(nonzero * np.log2(nonzero)))
+    return 2.0 ** H
+
+
 def _neff_kde_normalized(fx: np.ndarray, fy: np.ndarray) -> float:
     """Torus KDE N_eff mapped to [1, N] scale.
 
-    Parameters
-    ----------
-    fx, fy : ndarray
-        Sub-pixel fractional offsets in [0, 1).
-
-    Returns
-    -------
-    float
-        N_eff in [1.0, len(fx)]. Higher = better sub-pixel coverage.
+    Falls back to _neff_histogram() if scipy is unavailable
+    (never returns float(n), which would over-estimate blur_limit).
     """
     try:
         from scipy.stats import gaussian_kde
     except ImportError:
-        return float(len(fx))
+        logger.warning("scipy unavailable; falling back to histogram N_eff")
+        return _neff_histogram(fx, fy)
 
     n = len(fx)
     grid_n = NEFF_KDE_GRID
     bw     = NEFF_KDE_BW
 
-    # Evaluation grid
     xs = np.linspace(0, 1, grid_n, endpoint=False)
     xx, yy = np.meshgrid(xs, xs)
     pts = np.vstack([xx.ravel(), yy.ravel()])
 
-    # Torus wrapping: replicate 3×3 neighbourhood
     data = np.array([fx, fy])
     mirrors = []
     for dx in (-1, 0, 1):
@@ -82,8 +83,9 @@ def _neff_kde_normalized(fx: np.ndarray, fy: np.ndarray) -> float:
     try:
         kde = gaussian_kde(data_torus, bw_method=bw)
         density = kde(pts)
-    except Exception:
-        return float(n)
+    except Exception as exc:
+        logger.warning("KDE failed (%s); falling back to histogram N_eff", exc)
+        return _neff_histogram(fx, fy)
 
     density = np.maximum(density, 0.0)
     s = density.sum()
@@ -91,11 +93,8 @@ def _neff_kde_normalized(fx: np.ndarray, fy: np.ndarray) -> float:
         return 1.0
     density /= s
 
-    # Discrete Shannon entropy
     mask = density > 1e-15
     H = float(-np.sum(density[mask] * np.log2(density[mask])))
-
-    # Normalize to [1, n]: H=0 → 1.0, H=log2(grid_n²) → n
     H_max = math.log2(grid_n ** 2)
     N_eff = 1.0 + (H / H_max) * (n - 1.0)
     return float(np.clip(N_eff, 1.0, float(n)))
@@ -107,17 +106,7 @@ def calculate_dither_quality_neff(
     """Estimate sub-pixel dither quality via entropy N_eff.
 
     Uses KDE-normalized N_eff for n ≥ NEFF_KDE_MIN_FRAMES,
-    falling back to 4×4 histogram Shannon entropy for smaller bursts.
-
-    Parameters
-    ----------
-    M_list : list of Optional[np.ndarray]
-        List of 2×3 affine matrices (or None for rejected frames).
-
-    Returns
-    -------
-    float
-        N_eff in [1.0, n_valid]. Higher = better sub-pixel coverage.
+    falling back to 4×4 histogram for smaller bursts or missing scipy.
     """
     fxs, fys = [], []
     for M in M_list:
@@ -134,24 +123,10 @@ def calculate_dither_quality_neff(
 
     if n >= NEFF_KDE_MIN_FRAMES:
         N_eff = _neff_kde_normalized(fx, fy)
-        logger.debug(
-            "Dither quality (KDE): n=%d, N_eff=%.3f",
-            n, N_eff,
-        )
+        logger.debug("Dither quality (KDE): n=%d, N_eff=%.3f", n, N_eff)
     else:
-        # Histogram fallback for very small bursts
-        hist, _, _ = np.histogram2d(
-            fx, fy, bins=_DITHER_GRID_N,
-            range=[[0.0, 1.0], [0.0, 1.0]],
-        )
-        hist = hist / max(hist.sum(), 1e-9)
-        nonzero = hist[hist > 0]
-        H = float(-np.sum(nonzero * np.log2(nonzero)))
-        N_eff = 2.0 ** H
-        logger.debug(
-            "Dither quality (hist-fallback): n=%d, N_eff=%.3f",
-            n, N_eff,
-        )
+        N_eff = _neff_histogram(fx, fy)
+        logger.debug("Dither quality (hist-fallback): n=%d, N_eff=%.3f", n, N_eff)
 
     return float(N_eff)
 
@@ -160,12 +135,7 @@ def select_reference_frame(
     images: list[np.ndarray],
     M_list: list[Optional[np.ndarray]],
 ) -> int:
-    """Harmony Anchor: Select the optimal reference frame.
-
-    Computes the geometric median of all translation vectors (Weiszfeld's
-    algorithm) to find the most 'harmonious' structural baseline, then
-    selects the sharpest frame near that center.
-    """
+    """Harmony Anchor: Select the optimal reference frame."""
     n = len(images)
     if n <= 1:
         return 0
