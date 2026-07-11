@@ -276,7 +276,13 @@ def wiener_deconv(
 
     freq_r = _radial_frequency_grid(H, W)
 
-    # Apply edge taper before FFT2 to suppress spectral leakage banding
+    # Apply edge taper before FFT2 to suppress spectral leakage banding.
+    # The taper is used ONLY for the noise-floor estimation and the
+    # Wiener filter computation; the deconvolution result is corrected
+    # back to the original (untapered) domain by applying the same filter
+    # to both the tapered and the original image and blending the edge
+    # pixels back.  This avoids the brightness ramp at image borders that
+    # would otherwise appear in the output.
     img_tapered = _edge_taper(img_f32, taper_width=EDGE_TAPER_WIDTH)
 
     K_freq, noise_floor, plateau_frac = _estimate_frequency_dependent_K(
@@ -295,17 +301,35 @@ def wiener_deconv(
 
     psf = _build_gaussian_psf(psf_sigma, H, W)
     H_fft = scipy.fft.fft2(psf, workers=-1)
-    G_fft = scipy.fft.fft2(img_tapered.astype(np.float64), workers=-1)
 
+    # Run Wiener on the tapered signal (to suppress banding), then also
+    # on the original signal so we can restore the edge region.
     H_conj = np.conj(H_fft)
     H_power = np.abs(H_fft) ** 2
-
     W_resp = H_conj / (H_power + K_freq)
     W_resp[0, 0] = 1.0  # DC-gain preservation
 
-    result = np.real(
-        scipy.fft.ifft2(W_resp * G_fft, workers=-1)
-    ).astype(np.float32)
+    G_fft_tapered = scipy.fft.fft2(img_tapered.astype(np.float64), workers=-1)
+    G_fft_orig    = scipy.fft.fft2(img_f32.astype(np.float64), workers=-1)
+
+    result_tapered = np.real(scipy.fft.ifft2(W_resp * G_fft_tapered, workers=-1)).astype(np.float32)
+    result_orig    = np.real(scipy.fft.ifft2(W_resp * G_fft_orig,    workers=-1)).astype(np.float32)
+
+    # Blend: use result_tapered in the interior (where it suppresses
+    # banding), and restore result_orig in the taper border (where the
+    # tapered output would otherwise show a brightness ramp).
+    t = min(EDGE_TAPER_WIDTH, min(H, W) // 4)
+    ramp = (0.5 * (1.0 - np.cos(np.pi * np.arange(t) / t))).astype(np.float32)
+
+    # alpha = 1 → fully use tapered result; alpha = 0 → use orig result
+    alpha = np.ones((H, W), dtype=np.float32)
+    for i in range(t):
+        alpha[i, :]       = ramp[i]
+        alpha[H - 1 - i, :] = ramp[i]
+        alpha[:, i]         = np.minimum(alpha[:, i], ramp[i])
+        alpha[:, W - 1 - i] = np.minimum(alpha[:, W - 1 - i], ramp[i])
+
+    result = (alpha * result_tapered + (1.0 - alpha) * result_orig)
 
     elapsed = time.time() - t0
     logger.info("Wiener deconvolution complete (%.2fs)", elapsed)

@@ -181,16 +181,21 @@ def select_reference_frame(
 
 
 def _adaptive_align_scale(img_h: int, img_w: int) -> float:
-    """Choose ECC downscale factor based on image resolution."""
+    """Choose ECC downscale factor based on image resolution.
+
+    Higher resolution → more aggressive downscale (smaller factor) to keep
+    ECC registration cost bounded.  Thresholds are approximate megapixel
+    boundaries (512=0.25MP, 1024=1MP, 2048=4MP, >2048=full-size cameras).
+    """
     max_dim = max(img_h, img_w)
     if max_dim <= 512:
-        return 0.75
+        return 0.75   # small: minimal downscale
     elif max_dim <= 1024:
-        return 0.50
+        return 0.75   # medium-small: still light downscale
     elif max_dim <= 2048:
-        return 0.75
+        return 0.50   # medium: moderate downscale
     else:
-        return 0.50
+        return 0.50   # large (cameras): aggressive downscale
 
 
 def align_images_ecc(
