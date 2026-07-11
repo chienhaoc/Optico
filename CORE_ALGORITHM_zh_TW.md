@@ -12,9 +12,11 @@
 |---|---|---|
 | Phase 2 — ECC 對齊 | `gauss_filt_size = 5` | `gauss_filt_size = 7` |
 | Phase 8 — Drizzle | coverage-hole 填補（通用） | 同左 |
-| Phase 9 — 反捲積 | PSF σ = `0.4·S`，HF fraction = 0.75，taper = 48 px | PSF σ ×1.35，HF fraction = 0.60，taper = 48 px |
+| Phase 9 — 反捲積 | PSF σ = `0.4·S`，HF fraction = 0.75，taper = 48 px | PSF σ ×1.10，HF fraction = 0.60，taper = 48 px |
 
 可透過 `config.jpeg_input = True/False` 或 CLI 旗標 `--jpeg` / `--raw` 強制覆蓋。
+
+無論哪一欄，自動估計出的 PSF σ 在傳入 Wiener 濾波器前，都還會再經過第 5 節所述的格柵安全公式進行上限箝制。
 
 ---
 
@@ -92,13 +94,21 @@ $$I_{\text{HR}}(x,y) = \frac{\text{Num}(x,y)}{\max(\text{Den}(x,y),\ 10^{-6})}$$
 
 ### Coverage-Hole 填補
 
-反向 4-鄰域 overlap 核心有一個結構性盲點：當最近的 LR 像素中心投影位置距 HR 像素中心超過 $r_{\text{drop}}$ 時，overlap = 0。若所有幀的次像素偏移碰巧都落在同一個死角，這些 HR 像素在每幀中都是 under-covered，歸一化後放大數值雜訊，形成肉眼可見的格子狀亮暗紋。
+反向 4-鄰域 overlap 核心（`kernel_mode='box'`）有一個結構性盲點：當最近的 LR 像素中心投影位置距 HR 像素中心超過 $r_{\text{drop}}$ 時，overlap = 0。若所有幀的次像素偏移碰巧都落在同一個死角，這些 HR 像素在每幀中都是 under-covered，歸一化後放大數值雜訊，形成肉眼可見的格子狀亮暗紋。
 
-**修復方式：** 累加完成、歸一化之前，對滿足下列條件的 HR 像素標記為 coverage hole（$\tau = 0.35$）：
+**修復方式：** 累加完成、歸一化之前，對滿足下列條件的 HR 像素標記為 coverage hole（$\tau = 0.15$，`DRIZZLE_COVERAGE_FLOOR_RATIO`）：
 $$\text{Den}(x,y) < \tau \cdot \text{median}(\text{Den})$$
-並以 3×3 Gaussian 鄰域平均填補其 numerator 與 denominator：
+並以 3×3 uniform（box）鄰域平均填補其 numerator 與 denominator：
 $$\text{Den}_{\text{filled}}(x,y) = (\text{uniform\_filter}_{3\times3} * \text{Den})(x,y)$$
-此操作等同於從周圍覆蓋良好的像素做雙線性插值。僅 hole 像素被修改，正常像素完全不受影響。
+此操作等同於從周圍覆蓋良好的像素做雙線性插值。僅 hole 像素被修改，正常像素完全不受影響。此安全網對每種 `kernel_mode` 都會執行，但下方的 sinc 型核心本身沒有結構性零點，因此極少被觸發。
+
+### 核心選擇 (`kernel_mode`)
+
+上述 `box` 存在一個真實而非僅是理論上的失效模式：一份真實連拍照片基準測試（`backend/benchmarks/kernel_bench.py`，兩組 Sony A7C 腳架連拍，$S=2.0$）以 `grid_periodicity_score`（在 alias-wrapped 格柵頻率 $1/S$ 處量測的 FFT peak-to-floor 比值）量化其 coverage-hole 格柵瑕疵，發現比下列 sinc 型替代方案嚴重 3-17 倍，證實上述 coverage-hole 填補並未完全消除底層的週期性殘留紋。
+
+- **`lanczos2`**（預設，2026-07 變更）：windowed sinc 核心，$a=2$（`_lanczos`、`DRIZZLE_LANCZOS_A`）。每個 HR 像素都能從至少一個 LR 像素獲得正權重——沒有結構性零點，因此不會產生週期性 coverage-hole 格柵。搭配格柵安全 PSF 上限（第 5 節），在兩組真實連拍上同時於振鈴、格柵週期性、leave-one-out 保真度三項指標勝過 `box`——是真正的全面改善，而非取捨。完整數據見 `backend/benchmarks/reports/`。
+- **`lanczos2_clamped`**：與 `lanczos2` 相同的核心形狀，但負向 sidelobe 權重歸零（`clamp_negative=True`），目的是消除 Gibbs 式振鈴。已完成基準測試但未選為預設：在相同 PSF 下振鈴略有降低，但反直覺地在多數測試的 PSF 值下 grid_periodicity 反而比純 `lanczos2` 更高——歸零負向 lobe 並不能一致地改善覆蓋均勻度。
+- **`box_supersample`**：以 `box` 核心在 `DRIZZLE_SUPERSAMPLE_FACTOR` 倍的目標倍率下累加，再以 area-decimate（`cv2.INTER_AREA`）縮回目標倍率——這是標準的反鋸齒策略，將週期性零點推至 Nyquist 之上後再做正確的低通降採樣。已測試並捨棄：grid_periodicity 僅降低約 30-50%（相較 lanczos2 的 3-17 倍），振鈴無改善，且增加運算成本。
 
 ---
 
@@ -132,9 +142,19 @@ $$\sigma_{\text{PSF}} = \max(0.4,\ 0.4 \cdot S_{\text{final}})$$
 
 **JPEG 補正：** JPEG 量化會在光學 PSF 之外疊加一個量化模糊 PSF（$\sigma_{\text{JPEG}} \approx 0.3\text{–}0.5\ \text{px}$），複合有效 sigma 為：
 $$\sigma_{\text{eff}} = \sqrt{\sigma_{\text{optical}}^2 + \sigma_{\text{JPEG}}^2} \approx \sigma_{\text{optical}} \times 1.35$$
-JPEG 輸入時，`psf_sigma` 乘以 `JPEG_PSF_SCALE_FACTOR = 1.35`。
+JPEG 輸入時，`psf_sigma` 乘以 `JPEG_PSF_SCALE_FACTOR`。此值已從 `1.35` 下調至 `1.10`（2026-07）：1.35 的複合模糊估計高估了真實 PSF，在截止頻率附近造成過度的反濾波增益，於高對比邊緣後方產生約 3px 寬的 undershoot 帶（沙箱量測：post-edge undershoot −8.74 → −5.61 ADU，高對比 PSNR +0.83 dB）。`1.10` 仍能補正真實 JPEG 量化模糊，同時將 overshoot 控制在視覺可察覺門檻之下。
 
-**手動覆寫：** 使用 `--psf-override <sigma_lr>` 可直接指定光學 PSF sigma（LR 像素單位）。Pipeline 會自動乘以 `final_scale` 換算為 HR 像素後傳入 Wiener 濾波器。對長焦鏡頭或預設自動估計補正不足時建議使用。
+**手動覆寫：** 使用 `--psf-override <sigma_hr>` 可直接指定 PSF sigma，**單位為 HR 像素**——這是刻意的慣例（見 `pipeline.py` 模組 docstring）：此數值會被直接使用，**不會**像上方自動估計路徑那樣再乘以 `final_scale`。明確指定 override 也會跳過下方所述的格柵安全上限，因此它仍是一個原始數值，供受控實驗使用（例如 `backend/benchmarks/kernel_bench.py --psf-override`）。對長焦鏡頭、預設自動估計補正不足或過度、或需要做基準測試時建議使用。
+
+### 格柵安全 PSF Sigma 上限
+
+真實連拍照片基準測試發現，當 Wiener 濾波器的通帶觸及 Drizzle 核心殘留的格柵瑕疵頻率（第 4 節）時，反捲積會放大該瑕疵。對於標準差為 $\sigma$ 的高斯 PSF，Wiener 截止頻率近似為：
+$$f_c(\sigma) = \frac{\sqrt{\ln(1/K)}}{2\pi\sigma}$$
+Drizzle 格柵瑕疵位於空間頻率 $f_{\text{grid}} = 1/S$（每 HR 像素週期數），當 $S < 2$ 時需 alias-wrap 至 Nyquist 範圍 $(0, 0.5]$ 內。解 $f_c(\sigma) = f_{\text{grid}}$ 可得不會讓通帶觸及格柵頻率的最大 PSF sigma：
+$$\sigma_{\text{cap}} = \frac{\sqrt{\ln(1/K)}}{2\pi f_{\text{grid}}}$$
+其中 $K$ 以本次執行自身的診斷值 $K_{\text{est}}$（來自上方的 noise MAD）代入。此上限僅套用於**自動估計**的 `psf_sigma`（無論是 RAW 基準值或上方 JPEG 調整後的值）；明確指定的 `--psf-override` 不受此上限影響。
+
+**驗證：** 一次理論導向的參數掃描（`psf_override` $\in \{0.88, 0.80, 0.50, 0.40\}$，涵蓋 `lanczos2`/`lanczos2_clamped` 與兩組真實連拍，$S=2.0$）緊密驗證了此預測——grid_periodicity 在預測門檻值附近急劇下降（例如某連拍測得 $K_{\text{est}} \approx 0.08 \Rightarrow \sigma_{\text{cap}} \approx 0.51$，其 `grid_periodicity` worst-ratio 從 587.7（psf=0.88）降至 41.5（psf=0.50），低於此門檻後僅有邊際的額外改善）。完整數據見 `backend/benchmarks/reports/`。
 
 ### 頻率相依正則化 $K(f)$
 

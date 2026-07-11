@@ -99,20 +99,58 @@ DEFAULT_PIXFRAC: float = 0.7
 DEFAULT_NUM_CHUNKS: int = 8
 DRIZZLE_WEIGHT_FLOOR: float = 1e-6
 
-DRIZZLE_KERNEL_MODE: str = 'box'
-"""Default drizzle accumulation kernel: 'box' (validated) or 'lanczos2'.
+DRIZZLE_KERNEL_MODE: str = 'lanczos2'
+"""Default drizzle accumulation kernel: 'lanczos2' (validated), 'box',
+'lanczos2_clamped', or 'box_supersample'.
 
-Reverted to 'box' (2026-07): box-overlap at the default PIXFRAC (0.7) was
-verified — via the same synthetic ground-truth methodology used elsewhere
-in this codebase — to have zero structural coverage holes at N=7
-(coverage CV=0.114, 0% zero-coverage pixels), while producing ~4x sharper
-output (Laplacian variance 16,488 vs 4,223) than 'lanczos2'. The
-zero-coverage-hole failure mode that motivated 'lanczos2' only manifests
-at more aggressive settings (pixfrac<=0.5), not at the validated default.
-'lanczos2' is retained as a selectable option (config.kernel_mode=
-'lanczos2') for further testing, but is no longer the default until that
-failure mode is independently re-verified against real (not just
-synthetic) bursts.
+Changed to 'lanczos2' (2026-07, real-burst benchmark): the 2026-07 revert
+to 'box' below was validated only on synthetic data. A real-burst
+benchmark (backend/benchmarks/kernel_bench.py, two Sony A7C tripod
+bursts, 17mm + 50mm, scale=2.0) confirmed 'box's coverage-hole grid
+artifact is real and severe on actual photos (grid_periodicity worst
+peak-to-floor ratio 350-609 vs 'lanczos2' at matched settings), and that
+combined with the psf-sigma grid-safe cap documented under
+JPEG_PSF_SCALE_FACTOR / wiener_deconv() below, plain 'lanczos2' beats
+'box' on ringing, grid-periodicity, AND leave-one-out fidelity
+simultaneously on both real bursts — not merely a trade-off. Full data:
+backend/benchmarks/reports/input{3,4}_kernel_bench.json.
+
+'box' (2026-07, superseded above): box-overlap at the default PIXFRAC
+(0.7) was verified via synthetic ground truth to have zero structural
+coverage holes at N=7 while producing sharper output than 'lanczos2',
+but the real-burst benchmark above showed the zero-coverage-hole
+failure mode does manifest on real tripod bursts even at this pixfrac.
+Retained as a selectable option (config.kernel_mode='box') for
+comparison, no longer the default.
+
+'lanczos2_clamped' (2026-07, real-burst benchmark): same sinc-shaped
+footprint as 'lanczos2' but with negative sidelobe weights clamped to
+zero (see _lanczos(clamp_negative=True) in drizzle.py), intended to
+remove Gibbs-style ringing. The real-burst benchmark found it reduces
+ringing slightly vs plain 'lanczos2' at matched psf, but counter-
+intuitively has *higher* grid_periodicity at every tested psf_override
+except the lowest (0.4) — clamping the negative lobes does not
+uniformly improve coverage uniformity. Not selected as the default;
+retained as an option for further study.
+
+'box_supersample' (2026-07, benchmarked and discarded): accumulates with
+the plain 'box' kernel at DRIZZLE_SUPERSAMPLE_FACTOR times the requested
+scale, then area-decimates (cv2.INTER_AREA) back down. Benchmarked on
+both real bursts: only reduced grid_periodicity by ~30-50% (e.g. 609 ->
+452 on the 17mm burst), far short of 'lanczos2's reduction, with no
+ringing benefit and added compute cost. Discarded per user decision;
+code retained but not recommended.
+"""
+
+DRIZZLE_SUPERSAMPLE_FACTOR: int = 2
+"""Supersample multiplier for kernel_mode='box_supersample'.
+
+Kept conservative (2x, not 4x) given real-burst benchmarking on a 16GB
+machine already hit OOM/timeout risk with plain 'lanczos2' at full
+resolution — 2x keeps each chunk's supersampled intermediate array small
+(~100-150MB at typical benchmark crop sizes) since drizzle_stack()
+processes it one output chunk at a time, never holding a full-image
+supersampled canvas. Increase only after confirming 2x is safe.
 """
 """Default Drizzle kernel. 'box' for diagnostic comparison."""
 

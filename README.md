@@ -36,9 +36,13 @@ Optico auto-detects input format by reading file headers (JPEG SOI marker `0xFF 
 
 - **Phase 2 alignment:** ECC Gaussian filter enlarged 5 → 7 px to suppress 8×8 DCT inter-block edges that bias sub-pixel offset estimation.
 - **Phase 8 Drizzle:** coverage-hole fill active for all inputs.
-- **Phase 9 deconvolution:** PSF sigma ×1.35 (composite optical + JPEG quantisation blur); noise-floor scan range lowered from 0.75 → 0.60 × Nyquist to avoid JPEG spectral cutoff inflating the noise estimate.
+- **Phase 9 deconvolution:** PSF sigma ×1.10 (composite optical + JPEG quantisation blur), then capped by a grid-safe formula (see below) before use; noise-floor scan range lowered from 0.75 → 0.60 × Nyquist to avoid JPEG spectral cutoff inflating the noise estimate.
 
 Use `--jpeg` or `--raw` to override auto-detection.
+
+### Drizzle Kernel
+
+`kernel_mode` (default **`lanczos2`**) selects Phase 8's accumulation kernel. A real-burst benchmark (`backend/benchmarks/kernel_bench.py`) found the previous `box` default's coverage-hole grid artifact is real and severe on actual tripod bursts; `lanczos2`, combined with a grid-safe cap on the auto-estimated Phase 9 PSF sigma (which prevents the Wiener filter from amplifying that same grid frequency), beat `box` on ringing, grid-periodicity, and leave-one-out fidelity simultaneously — see [CORE_ALGORITHM.md](CORE_ALGORITHM.md) §4–5 and `backend/benchmarks/reports/` for the full data. `box`, `lanczos2_clamped`, and `box_supersample` remain selectable via `config.kernel_mode` for comparison.
 
 ---
 

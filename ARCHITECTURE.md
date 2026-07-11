@@ -18,7 +18,7 @@ Optico/
 │   ├── masking.py            # Motion detection & Poisson-Gaussian noise modeling
 │   ├── preflight.py          # Sampling theorem & CRLB resolution limits
 │   ├── drizzle.py            # Variable-Pixel Linear Reconstruction with memory chunking
-│   ├── deconvolution.py      # Spatial-domain blended dual-band Wiener deconvolution
+│   ├── deconvolution.py      # Frequency-dependent Wiener deconvolution with grid-safe PSF cap
 │   └── pipeline.py           # Pipeline runner orchestration & CLI handler
 └── requirements.txt          # Declared packages (numpy, opencv-python, scipy)
 ```
@@ -38,7 +38,7 @@ graph TD
     F --> G
     G --> H["Pre-flight Scale Bounding<br/>Phase 7"]
     H --> I["Vectorized Drizzle Stacking<br/>Phase 8"]
-    I --> J["Adaptive Dual-Band Wiener<br/>Deconvolution Phase 9"]
+    I --> J["Frequency-Dependent Wiener<br/>Deconvolution Phase 9"]
     J --> K["Final Output Image<br/>Phase 10"]
 ```
 
@@ -64,8 +64,10 @@ To protect against Alignment Drift Blur:
 ### 4. Drizzle Stacking (`drizzle.py`)
 * **Vectorized Warp**: Warps each frame and weight map onto the HR grid via `cv2.warpAffine` using scaling translations, achieving $O(N \cdot H \cdot W)$ vectorized efficiency.
 * **Active Memory Chunking**: Divides the HR canvas into horizontal strips. Each chunk is processed, normalized, and cast to float32 before the intermediate high-precision accumulators are deleted and `gc.collect()` is called to reclaim memory.
+* **Kernel Selection**: `kernel_mode` (default **`lanczos2`**, changed 2026-07) selects the accumulation kernel. A real-burst benchmark (`backend/benchmarks/kernel_bench.py`) found the previous `box` default's structural coverage-hole grid artifact is real and severe on actual tripod bursts, not just a synthetic edge case; `lanczos2` combined with the grid-safe PSF cap (see §5) beat `box` on ringing, grid-periodicity, and leave-one-out fidelity simultaneously. `box`, `lanczos2_clamped` (negative sidelobes zeroed), and `box_supersample` (supersample + area-decimate) remain selectable for comparison. See [CORE_ALGORITHM.md](CORE_ALGORITHM.md) §4 for details.
 
 ### 5. Deconvolution (`deconvolution.py`)
 * **Noise MAD**: Dynamically computes the global noise level $\sigma_{noise}$ using the corrected median absolute deviation (MAD) of the Laplacian: $1.4826 \cdot \text{median}(|\text{Lap}(I) - \text{median}(\text{Lap}(I))|)$.
-* **Dual-Band Wiener**: Performs frequency-domain deconvolution using Aggressive ($K_{strong}$) and Conservative ($K_{weak}$) regularizers.
-* **Spatial Blending**: Blends the two restored frequency images in the spatial domain using a soft Canny-based edge mask to sharpen flat regions while avoiding edge ringing.
+* **Frequency-Dependent Wiener**: Estimates a per-frequency regularization map $K(f)$ directly from the image's own power spectrum via plateau detection, rather than a scalar or dual-band Canny-blended $K$ (an earlier scheme, since superseded — see [OPTICO_GLOSSARY.md](OPTICO_GLOSSARY.md)). This matches the textbook SNR-inverse Wiener solution and was measured at +1.54 dB average PSNR over the dual-band scheme.
+* **Grid-Safe PSF Cap**: Caps the auto-estimated PSF sigma so the Wiener filter's passband cannot reach the Drizzle kernel's residual grid-artifact frequency — the real-burst mechanism behind the `lanczos2` default change above. Only applies to auto-estimated PSF sigma, not an explicit `--psf-override`. See [CORE_ALGORITHM.md](CORE_ALGORITHM.md) §5.
+* **Edge Taper**: Applies a cosine taper to image borders before FFT2 to suppress spectral-leakage banding that would otherwise cross smooth regions such as faces.

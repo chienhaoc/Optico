@@ -36,9 +36,13 @@ Optico 透過讀取檔案 header（JPEG SOI 標記 `0xFF 0xD8`）自動偵測輸
 
 - **Phase 2 對齊：** ECC 高斯濾波核心從 5 → 7 px，壓制 8×8 DCT inter-block 邊界假梯度，避免次像素偏移估計偏差。
 - **Phase 8 Drizzle：** coverage-hole 填補對所有輸入通用。
-- **Phase 9 反捲積：** PSF sigma ×1.35（複合光學 + JPEG 量化模糊）；噪聲基準面掃描起點從 0.75 → 0.60 × Nyquist，避免 JPEG 頻率截止帶被誤判為白噪聲，高估噪聲基準導致高頻細節過度壓制。
+- **Phase 9 反捲積：** PSF sigma ×1.10（複合光學 + JPEG 量化模糊），之後再套用格柵安全上限公式（見下方）；噪聲基準面掃描起點從 0.75 → 0.60 × Nyquist，避免 JPEG 頻率截止帶被誤判為白噪聲，高估噪聲基準導致高頻細節過度壓制。
 
 使用 `--jpeg` 或 `--raw` 可強制覆蓋自動偵測結果。
+
+### Drizzle 核心選擇
+
+`kernel_mode`（預設 **`lanczos2`**）決定 Phase 8 的累加核心。真實連拍照片基準測試（`backend/benchmarks/kernel_bench.py`）發現舊預設 `box` 的 coverage-hole 格柵瑕疵在真實腳架連拍上確實嚴重存在；`lanczos2` 搭配 Phase 9 自動估計 PSF sigma 的格柵安全上限（避免 Wiener 濾波器放大同一個格柵頻率），同時在振鈴、格柵週期性、leave-one-out 保真度三項指標勝過 `box`——詳見 [CORE_ALGORITHM_zh_TW.md](CORE_ALGORITHM_zh_TW.md) 第 4–5 節與 `backend/benchmarks/reports/` 完整數據。`box`、`lanczos2_clamped`、`box_supersample` 仍可透過 `config.kernel_mode` 選用以供比較。
 
 ---
 

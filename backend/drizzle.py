@@ -56,6 +56,7 @@ import gc
 import logging
 from typing import Optional
 
+import cv2
 import numpy as np
 from scipy.ndimage import uniform_filter
 
@@ -65,6 +66,7 @@ from .constants import (
     DRIZZLE_COVERAGE_FLOOR_RATIO,
     DRIZZLE_KERNEL_MODE,
     DRIZZLE_LANCZOS_A,
+    DRIZZLE_SUPERSAMPLE_FACTOR,
 )
 
 logger = logging.getLogger(__name__)
@@ -73,7 +75,7 @@ logger = logging.getLogger(__name__)
 _NEIGHBOUR_OFFSETS = np.array([[0, 0], [0, 1], [1, 0], [1, 1]], dtype=np.int32)
 
 
-def _lanczos(x: np.ndarray, a: int = 2) -> np.ndarray:
+def _lanczos(x: np.ndarray, a: int = 2, clamp_negative: bool = False) -> np.ndarray:
     """Lanczos kernel: sinc(x) * sinc(x/a) for |x| < a, else 0.
 
     Vectorised over any shaped ndarray.
@@ -87,6 +89,15 @@ def _lanczos(x: np.ndarray, a: int = 2) -> np.ndarray:
     (numpy evaluates both branches unconditionally), which previously
     produced RuntimeWarning: invalid value encountered in divide even
     though the final result was correct.
+
+    Parameters
+    ----------
+    clamp_negative : bool
+        If True, zero out the negative sidelobes (kernel_mode=
+        'lanczos2_clamped').  Trades the sinc kernel's negative-lobe
+        ringing suppression capability away in exchange for a strictly
+        positive kernel, which cannot itself produce Gibbs-style
+        overshoot/undershoot.  See DRIZZLE_KERNEL_MODE in constants.py.
     """
     out = np.zeros_like(x, dtype=np.float64)
 
@@ -100,6 +111,9 @@ def _lanczos(x: np.ndarray, a: int = 2) -> np.ndarray:
         xv    = x[nonzero]
         pi_x  = np.pi * xv
         out[nonzero] = a * np.sin(pi_x) * np.sin(pi_x / a) / (pi_x ** 2)
+
+    if clamp_negative:
+        np.maximum(out, 0.0, out=out)
 
     return out
 
@@ -165,6 +179,7 @@ def _drizzle_chunk_lanczos(
     y_end_hr: int,
     hr_w: int,
     lanczos_a: int = DRIZZLE_LANCZOS_A,
+    clamp_negative: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Lanczos-2 Drizzle accumulation for a single HR chunk.
 
@@ -224,7 +239,7 @@ def _drizzle_chunk_lanczos(
             in_y  = (y0_lr + dy >= 0) & (y0_lr + dy < lr_h)  # (H, 1)
             # LR y-distance in LR units for Lanczos weight
             d_y = y_LR - (yn_lr.astype(np.float64))    # (H, 1)
-            w_y = _lanczos(d_y, a=lanczos_a)           # (H, 1)
+            w_y = _lanczos(d_y, a=lanczos_a, clamp_negative=clamp_negative)  # (H, 1)
 
             for dx in range(-lanczos_a + 1, lanczos_a + 1):
                 xn_lr = np.clip(x0_lr + dx, 0, lr_w - 1)  # (1, W)
@@ -233,7 +248,7 @@ def _drizzle_chunk_lanczos(
                 in_bounds = (in_y & in_x).astype(np.float64)  # (H, W)
 
                 d_x = x_LR - (xn_lr.astype(np.float64))    # (1, W)
-                w_x = _lanczos(d_x, a=lanczos_a)           # (1, W)
+                w_x = _lanczos(d_x, a=lanczos_a, clamp_negative=clamp_negative)  # (1, W)
 
                 # 2-D separable Lanczos weight
                 w_lanczos = w_y * w_x * in_bounds           # (H, W)
@@ -317,6 +332,7 @@ def drizzle_stack(
     scale: float,
     ref_idx: int = 0,
     config: Optional[OpticoConfig] = None,
+    coverage_out: Optional[dict] = None,
 ) -> np.ndarray:
     """Phase 8: Drizzle Multi-Frame Stacking with Lanczos-2 Kernel.
 
@@ -333,6 +349,15 @@ def drizzle_stack(
     scale : float — output upscale factor from Pre-flight
     ref_idx : int — reference frame index
     config : OpticoConfig, optional
+    coverage_out : dict, optional
+        If provided, populated (in place) with the raw (pre-safety-net-fill)
+        coverage-denominator diagnostics for this run: 'cv', 'holes_pct',
+        'mean', 'median'. Piggybacks on the accumulation this function
+        already does instead of a second pass over the same kernel — see
+        backend/benchmarks/metrics.py, which needed this because a
+        stand-alone second Lanczos-2 accumulation pass roughly doubled
+        wall-clock time for the 'lanczos2'/'lanczos2_clamped' benchmarks.
+        Existing callers are unaffected (default None, no extra work).
 
     Returns
     -------
@@ -361,6 +386,9 @@ def drizzle_stack(
     output = np.zeros((hr_h, hr_w, 3), dtype=np.float32)
     chunk_boundaries = np.linspace(0, hr_h, num_chunks + 1, dtype=int)
 
+    coverage_rows: list[np.ndarray] = [] if coverage_out is not None else None
+    coverage_border = int(4 * scale) + 8
+
     for chunk_idx in range(num_chunks):
         y_start = int(chunk_boundaries[chunk_idx])
         y_end   = int(chunk_boundaries[chunk_idx + 1])
@@ -377,12 +405,64 @@ def drizzle_stack(
                 images, M_list, weight_maps, scale, pixfrac,
                 y_start, y_end, hr_w,
             )
-        else:  # 'lanczos2' (default)
+        elif kernel_mode == 'lanczos2_clamped':
+            numerator, denominator = _drizzle_chunk_lanczos(
+                images, M_list, weight_maps, scale,
+                y_start, y_end, hr_w,
+                lanczos_a=DRIZZLE_LANCZOS_A,
+                clamp_negative=True,
+            )
+        elif kernel_mode == 'box_supersample':
+            # Accumulate with plain 'box' at DRIZZLE_SUPERSAMPLE_FACTOR times
+            # the requested scale, one output chunk at a time (never a
+            # whole-image supersampled canvas -- see DRIZZLE_SUPERSAMPLE_FACTOR
+            # in constants.py for why this matters for memory), then
+            # area-decimate back down. The decimation is a positive-only
+            # low-pass filter, so it can suppress box's periodic coverage-zero
+            # grid artifact (aliased to a frequency far above final Nyquist)
+            # without introducing lanczos2's negative-sidelobe ringing.
+            ss = DRIZZLE_SUPERSAMPLE_FACTOR
+            chunk_h = y_end - y_start
+            num_super, den_super = _drizzle_chunk_vectorized(
+                images, M_list, weight_maps, scale * ss, pixfrac,
+                y_start * ss, y_end * ss, hr_w * ss,
+            )
+            safe_den_super = np.maximum(den_super, DRIZZLE_WEIGHT_FLOOR)
+            img_super = (num_super / safe_den_super[:, :, None]).astype(np.float32)
+            del num_super, safe_den_super
+            img_down = cv2.resize(img_super, (hr_w, chunk_h), interpolation=cv2.INTER_AREA)
+            coverage_denom_chunk = cv2.resize(
+                den_super.astype(np.float32), (hr_w, chunk_h), interpolation=cv2.INTER_AREA
+            ).astype(np.float64)
+            del den_super, img_super
+            # numerator/denominator = (already-normalised image, all-ones) so
+            # the shared safety-net-fill + division logic below is a no-op:
+            # decimation already removed the structural holes that fill
+            # exists to patch.
+            numerator = img_down.astype(np.float64)
+            denominator = np.ones((chunk_h, hr_w), dtype=np.float64)
+        else:  # 'lanczos2'
             numerator, denominator = _drizzle_chunk_lanczos(
                 images, M_list, weight_maps, scale,
                 y_start, y_end, hr_w,
                 lanczos_a=DRIZZLE_LANCZOS_A,
             )
+
+        # For box_supersample, measure coverage on the *decimated* raw denom
+        # (the residual variation that survives anti-aliasing), not the
+        # placeholder all-ones `denominator` used for image reconstruction --
+        # otherwise this would trivially (and misleadingly) always read cv=0.
+        coverage_source = (
+            coverage_denom_chunk if kernel_mode == 'box_supersample' else denominator
+        )
+        if coverage_rows is not None:
+            row_lo = max(y_start, coverage_border)
+            row_hi = min(y_end, hr_h - coverage_border)
+            if row_hi > row_lo:
+                coverage_rows.append(
+                    coverage_source[row_lo - y_start:row_hi - y_start,
+                                     coverage_border:hr_w - coverage_border].copy()
+                )
 
         # Safety-net fill (rarely triggered with Lanczos)
         numerator, denominator = _fill_coverage_holes(
@@ -400,4 +480,24 @@ def drizzle_stack(
 
     np.clip(output, 0.0, 255.0, out=output)
     logger.info("Drizzle stacking complete: output shape %s, kernel=%s", output.shape, kernel_mode)
+
+    if coverage_out is not None:
+        if coverage_rows:
+            interior = np.concatenate(coverage_rows, axis=0)
+            pos = interior[interior > DRIZZLE_WEIGHT_FLOOR]
+            if pos.size > 0:
+                median_denom = float(np.median(pos))
+                mean_denom = float(np.mean(pos))
+                std_denom = float(np.std(pos))
+                coverage_out["cv"] = std_denom / mean_denom if mean_denom > 0 else 0.0
+                coverage_out["holes_pct"] = 100.0 * float(
+                    np.mean(interior < DRIZZLE_COVERAGE_FLOOR_RATIO * median_denom)
+                )
+                coverage_out["mean"] = mean_denom
+                coverage_out["median"] = median_denom
+            else:
+                coverage_out.update(cv=0.0, holes_pct=100.0, mean=0.0, median=0.0)
+        else:
+            coverage_out.update(cv=0.0, holes_pct=100.0, mean=0.0, median=0.0)
+
     return output

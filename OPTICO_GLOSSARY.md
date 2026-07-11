@@ -35,8 +35,11 @@ Optico's core architectural layout. It splits the MFSR process into two parallel
 * **Full Track (Low-Frequency)**: Uses the entire frame stack (with heavy Gaussian low-pass filtering) to construct a zero-noise color and illumination base.
 The two are fused seamlessly, bypassing the traditional single-track limitations.
 
-### 🎛️ Dual-Band Edge-Aware Wiener Deconvolution (雙頻邊緣感知維納反捲積)
-A highly specialized frequency-domain filter used in Phase 9. Instead of applying a uniform deconvolution (which causes ringing artifacts on edges and amplifies noise in flat areas), it constructs two parallel restored frequencies ($K_{strong}$ for flat areas, $K_{weak}$ for harsh edges) and dynamically blends them using a spatial Sobel gradient map. This achieves absolute energy conservation ($Variance\_Boost \approx 1.00x$).
+### 🎯 Frequency-Dependent Wiener Deconvolution (頻率相依維納反捲積)
+The current Phase 9 filter, which replaced the Dual-Band Edge-Aware scheme below. Rather than a scalar or dual-band regularizer, it estimates a per-frequency map $K(f)$ directly from the image's own power spectrum (locating the white-noise plateau at high frequency). Natural-image spectra fall as $\sim 1/f^2$ while sensor noise is roughly flat — a single scalar $K$ cannot represent both regimes at once, but a per-frequency map does, directly matching the textbook SNR-inverse Wiener solution. Measured +1.54 dB average PSNR improvement over the dual-band approach across noise levels σ = 1–9.
+
+### 🕸️ Grid-Safe PSF Sigma Cap (格柵安全 PSF 標準差上限)
+A 2026-07 real-burst finding: Wiener deconvolution amplifies whatever residual grid artifact the Drizzle kernel (see the **Box-Overlap Drizzle Kernel** graveyard entry below) leaves behind, whenever the filter's passband reaches the grid's spatial frequency $f_{\text{grid}} = 1/S$. Since the Wiener cutoff frequency for a Gaussian PSF of sigma $\sigma$ is $f_c(\sigma) = \sqrt{\ln(1/K)}/(2\pi\sigma)$, solving $f_c(\sigma) = f_{\text{grid}}$ gives a theoretical upper bound $\sigma_{\text{cap}}$ beyond which the filter starts re-amplifying the grid. A theory-grounded sweep across two real tripod bursts confirmed the prediction closely: grid-periodicity collapsed sharply right at the predicted threshold, not gradually or at an arbitrary point — the kind of confirmation that justifies trusting the formula over further trial-and-error. Applied only to *auto-estimated* PSF sigma; an explicit `--psf-override` remains a raw, uncapped value for controlled experimentation.
 
 ## 4. Evolutionary Graveyard (失敗為成功之母)
 
@@ -56,3 +59,18 @@ The following algorithms were implemented, empirically tested, and ultimately ab
 * **What it was**: Hardcoded multiplier rules (e.g., limiting upscale to $1.2x$ or $1.6x$) based purely on human guessing to prevent Drizzle grid artifacts.
 * **Why it failed**: It lacked physical grounding. When alignment was perfect, $1.2x$ severely bottlenecked the potential resolution. When alignment was terrible, $1.6x$ caused catastrophic smearing and ringing.
 * **What it taught us**: Resolution cannot be guessed; it is a strict physical derivative of the alignment error. It was replaced by the **SNR Alignment Blur Limit**, which mathematically couples the scale ceiling to the actual Retained Pixel Ratio.
+
+### 🪦 Dual-Band Edge-Aware Wiener Deconvolution (雙頻邊緣感知維納反捲積)
+* **What it was**: The original Phase 9 filter. Instead of a uniform deconvolution, it constructed two parallel restored frequencies ($K_{strong}$ for flat areas, $K_{weak}$ for harsh edges) and dynamically blended them in the spatial domain via a Canny/Sobel edge mask, targeting absolute energy conservation ($Variance\_Boost \approx 1.00x$).
+* **Why it failed**: Not a failure of correctness, but of optimality — a synthetic ground-truth benchmark (noise σ = 1–9) found the **Frequency-Dependent Wiener Deconvolution** approach above consistently outperformed it (+1.54 dB average PSNR), because a flat $K$ within each spatial band still cannot represent how natural-image spectra ($\sim 1/f^2$) and sensor noise (flat) diverge across frequency, only across space.
+* **What it taught us**: The right axis to regularize along is frequency, not screen-space edge proximity. Spatial blending was solving the right problem (edges need different treatment than flat regions) on the wrong axis.
+
+### 🪦 Box-Overlap Drizzle Kernel — Second Revert (Box 疊圖核，二度淘汰)
+* **What it was**: The 4-neighbour overlap Drizzle kernel (`kernel_mode='box'`), reinstated as the default in 2026-07 after a synthetic ground-truth benchmark showed it had zero coverage holes at the validated `pixfrac=0.7` while being ~4× sharper than `lanczos2`.
+* **Why it failed (again)**: The synthetic validation didn't generalize. A real-burst benchmark (two Sony A7C tripod bursts, `backend/benchmarks/kernel_bench.py`) measured `box`'s structural coverage-hole grid pattern at 3–17× worse `grid_periodicity` than the sinc-shaped kernels, on real photographic content the synthetic test hadn't captured.
+* **What it taught us**: A synthetic-only benchmark validated a real physical mechanism (coverage-hole structural zeros exist) but not its real-world *severity* — the whole reason `input3`/`input4` real bursts were set aside earlier in the project. `lanczos2` was restored as the default, this time paired with the **Grid-Safe PSF Sigma Cap** above so the gain in coverage uniformity isn't erased by Phase 9 re-amplifying the residual grid.
+
+### 🪦 Box-Supersample Anti-Aliasing (Box 超取樣反鋸齒)
+* **What it was**: A candidate fix for `box`'s grid artifact: accumulate at 2× the requested scale using plain `box`, then area-decimate (`cv2.INTER_AREA`) back down — pushing the periodic coverage zeros above Nyquist before a proper low-pass decimation, the standard signal-processing anti-aliasing strategy.
+* **Why it failed**: Real-burst benchmarking showed it only reduced `grid_periodicity` by ~30–50%, far short of `lanczos2`'s 3–17× reduction, while adding real compute/memory cost (a full supersampled intermediate per chunk).
+* **What it taught us**: The grid artifact isn't purely a sampling-rate problem solvable by brute-force oversampling — `box`'s overlap kernel has *structural* zeros (some HR pixels get exactly zero weight from any LR frame), which a 2× supersample doesn't push far enough above Nyquist to fully separate from the signal band. The sinc-shaped kernels avoid this by construction (no HR pixel gets a zero weight in the first place), not by out-sampling it.

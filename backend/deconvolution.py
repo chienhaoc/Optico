@@ -59,6 +59,29 @@ Sandbox measurement (512×512 face scene, JPEG block residuals, n=8 runs):
 Cross-phase note: JPEG_ECC_GAUSS_FILT_SIZE (Phase 2) improves sub-pixel
 offset accuracy on JPEG input, which reduces alignment PSF contribution;
 this module handles the remaining quantisation-domain component.
+
+Grid-safe PSF sigma cap (2026-07)
+----------------------------------
+Real-burst benchmarking (backend/benchmarks/kernel_bench.py) found that
+Wiener deconvolution amplifies the drizzle-kernel's residual grid
+artifact whenever its passband reaches the grid's spatial frequency.
+For a Gaussian PSF of sigma, the Wiener cutoff frequency is
+approximately f_c(sigma) = sqrt(ln(1/K)) / (2*pi*sigma); the drizzle
+grid artifact sits at spatial frequency 1/scale cycles per HR pixel
+(alias-wrapped into the Nyquist range for scale < 2). Solving
+f_c(sigma) = f_grid for sigma gives the largest PSF sigma whose passband
+does not reach the grid frequency — see _grid_safe_psf_sigma_cap().
+
+A theory-grounded sweep (psf_override in {0.88 auto, 0.80, 0.50, 0.40}
+across both kernels and two real bursts, scale=2.0) confirmed this
+prediction closely: grid_periodicity collapses sharply right around the
+predicted threshold (e.g. lanczos2_clamped on the 50mm burst:
+worst_ratio 587.7 -> 311.9 -> 41.5 -> 30.6 for psf 0.88/0.8/0.5/0.4 vs a
+predicted threshold of ~0.51 from the measured K_est on that burst), with
+only marginal further gain below it. This is applied as a cap on the
+*auto*-computed psf_sigma only (not on an explicit --psf-override, which
+remains a raw manual value for experimentation). Full data:
+backend/benchmarks/reports/input{3,4}_kernel_bench.json.
 """
 import logging
 import time
@@ -210,6 +233,26 @@ def _find_noise_plateau(
     return noise_floor, plateau_frac
 
 
+def _grid_safe_psf_sigma_cap(K: float, scale: float) -> float:
+    """Largest Gaussian PSF sigma whose Wiener passband does not reach the
+    drizzle grid-artifact frequency, for regularization level K at the
+    given upscale factor.
+
+    f_c(sigma) = sqrt(ln(1/K)) / (2*pi*sigma); solving f_c(sigma) = f_grid
+    for sigma gives sigma_cap = sqrt(ln(1/K)) / (2*pi*f_grid). f_grid is
+    1/scale, alias-wrapped into (0, 0.5] since spatial frequencies above
+    Nyquist are not physically meaningful.
+    """
+    wrapped = (1.0 / scale) % 1.0
+    if wrapped > 0.5:
+        wrapped -= 1.0
+    f_grid = abs(wrapped)
+    if f_grid <= 1e-6:
+        return float("inf")
+    K_safe = max(K, 1e-6)
+    return float(np.sqrt(np.log(1.0 / K_safe)) / (2.0 * np.pi * f_grid))
+
+
 def _estimate_frequency_dependent_K(
     img_f32: np.ndarray,
     freq_r: np.ndarray,
@@ -261,12 +304,20 @@ def wiener_deconv(
     psf_sigma = max(PSF_SIGMA_MIN, PSF_SIGMA_SCALE * scale)
     if psf_override is not None:
         psf_sigma = float(psf_override)
-    elif jpeg_input:
-        psf_sigma *= JPEG_PSF_SCALE_FACTOR
-        logger.debug(
-            "JPEG input: psf_sigma scaled by %.2f → %.3f",
-            JPEG_PSF_SCALE_FACTOR, psf_sigma,
-        )
+    else:
+        if jpeg_input:
+            psf_sigma *= JPEG_PSF_SCALE_FACTOR
+            logger.debug(
+                "JPEG input: psf_sigma scaled by %.2f → %.3f",
+                JPEG_PSF_SCALE_FACTOR, psf_sigma,
+            )
+        grid_safe_cap = _grid_safe_psf_sigma_cap(K_est_diagnostic, scale)
+        if psf_sigma > grid_safe_cap:
+            logger.debug(
+                "psf_sigma capped %.3f → %.3f (grid-safe cap, K_est=%.4f, scale=%.2f)",
+                psf_sigma, grid_safe_cap, K_est_diagnostic, scale,
+            )
+            psf_sigma = grid_safe_cap
 
     noise_hf_fraction = (
         JPEG_NOISE_FLOOR_HIGH_FREQ_FRACTION
