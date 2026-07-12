@@ -43,7 +43,12 @@ JPEG_ECC_GAUSS_FILT_SIZE: int = 7
 # Dynamic Masking (Phase 6)
 # ============================================================
 NOISE_MODEL_GAIN: float = 0.5
-NOISE_MODEL_OFFSET: float = 1.0
+NOISE_MODEL_OFFSET: float = 10.0
+"""Raised from 1.0 → 10.0 (2026-07): prevents dark scene regions (e.g. projector
+body) from having their normalised diff inflated by a too-small noise denominator.
+With a=0.5, I=58 (dark corner): sqrt(0.5*58+1)=5.6 → denom floor was tiny.
+At 10.0: sqrt(0.5*58+10)=6.7+… adding 10 to the base lifts dark-area tolerance
+so they are judged on the same footing as mid-tones."""
 GRADIENT_WEIGHT: float = 0.3
 BG_MOTION_THRESHOLD: float = 1.5
 SUBJ_MOTION_THRESHOLD: float = 3.0
@@ -100,8 +105,8 @@ DEFAULT_NUM_CHUNKS: int = 8
 DRIZZLE_WEIGHT_FLOOR: float = 1e-6
 
 DRIZZLE_KERNEL_MODE: str = 'lanczos2'
-"""Default drizzle accumulation kernel: 'lanczos2' (validated), 'box',
-'lanczos2_clamped', or 'box_supersample'.
+"""Default drizzle accumulation kernel: 'lanczos2' (validated), 'nearest', 'bilinear',
+'lanczos4', 'box', 'lanczos2_clamped', or 'box_supersample'.
 
 Changed to 'lanczos2' (2026-07, real-burst benchmark): the 2026-07 revert
 to 'box' below was validated only on synthetic data. A real-burst
@@ -274,6 +279,11 @@ class OpticoConfig:
     kernel_mode: str = DRIZZLE_KERNEL_MODE
 
     psf_override: Optional[float] = None
+    psf_base: float = 0.63
     skip_deconv: bool = False
 
     jpeg_input: Optional[bool] = None
+    ecc_motion_mode: str = "affine"
+    frame_cc_threshold: float = 0.0
+    """Maximum allowed CC gap from the best frame. Frames with cc < best_cc - threshold
+    are discarded. 0.0 = keep all frames (default). Typical values: 0.003-0.010."""

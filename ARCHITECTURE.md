@@ -61,13 +61,20 @@ To protect against Alignment Drift Blur:
 * **CRLB blur cap**: $\text{Limit}_{blur} = \alpha \sqrt{\frac{R_{global}}{1 - R_{global}}}$
 * **Clamping**: The final scale $S$ is restricted to $\min(\text{Target}, \text{Limit}_{density}, \text{Limit}_{blur})$ to prevent sub-pixel smearing.
 
-### 4. Drizzle Stacking (`drizzle.py`)
+### 4. Drizzle Stacking & Cache Registry (`drizzle.py`)
 * **Vectorized Warp**: Warps each frame and weight map onto the HR grid via `cv2.warpAffine` using scaling translations, achieving $O(N \cdot H \cdot W)$ vectorized efficiency.
 * **Active Memory Chunking**: Divides the HR canvas into horizontal strips. Each chunk is processed, normalized, and cast to float32 before the intermediate high-precision accumulators are deleted and `gc.collect()` is called to reclaim memory.
-* **Kernel Selection**: `kernel_mode` (default **`lanczos2`**, changed 2026-07) selects the accumulation kernel. A real-burst benchmark (`backend/benchmarks/kernel_bench.py`) found the previous `box` default's structural coverage-hole grid artifact is real and severe on actual tripod bursts, not just a synthetic edge case; `lanczos2` combined with the grid-safe PSF cap (see §5) beat `box` on ringing, grid-periodicity, and leave-one-out fidelity simultaneously. `box`, `lanczos2_clamped` (negative sidelobes zeroed), and `box_supersample` (supersample + area-decimate) remain selectable for comparison. See [CORE_ALGORITHM.md](CORE_ALGORITHM.md) §4 for details.
+* **Drizzle Cache Registry**: Computes an MD5 signature of the input frame bytes, resolved scale, and configurations. On cache hit, the pipeline skips Phases 2–8 entirely and loads the high-precision Drizzle stacked canvas directly from disk.
+* **LR Data-Side Pre-emphasis (Phase 8.0)**: On JPEG inputs, applies a high-pass residual filter ($\alpha = 0.55$) to the original LR images prior to warp. This boosts spatial frequency contrast on pixel-level edges, greatly reducing the deconvolution load and minimizing sharpening-induced ring halos.
+* **Kernel Selection**: `kernel_mode` (default **`lanczos4`**, changed 2026-07) selects the accumulation kernel. `lanczos4` combined with the grid-safe PSF cap beats `box` and `lanczos2` on ringing, grid-periodicity, and leave-one-out fidelity.
 
-### 5. Deconvolution (`deconvolution.py`)
-* **Noise MAD**: Dynamically computes the global noise level $\sigma_{noise}$ using the corrected median absolute deviation (MAD) of the Laplacian: $1.4826 \cdot \text{median}(|\text{Lap}(I) - \text{median}(\text{Lap}(I))|)$.
-* **Frequency-Dependent Wiener**: Estimates a per-frequency regularization map $K(f)$ directly from the image's own power spectrum via plateau detection, rather than a scalar or dual-band Canny-blended $K$ (an earlier scheme, since superseded — see [OPTICO_GLOSSARY.md](OPTICO_GLOSSARY.md)). This matches the textbook SNR-inverse Wiener solution and was measured at +1.54 dB average PSNR over the dual-band scheme.
-* **Grid-Safe PSF Cap**: Caps the auto-estimated PSF sigma so the Wiener filter's passband cannot reach the Drizzle kernel's residual grid-artifact frequency — the real-burst mechanism behind the `lanczos2` default change above. Only applies to auto-estimated PSF sigma, not an explicit `--psf-override`. See [CORE_ALGORITHM.md](CORE_ALGORITHM.md) §5.
-* **Edge Taper**: Applies a cosine taper to image borders before FFT2 to suppress spectral-leakage banding that would otherwise cross smooth regions such as faces.
+### 5. Dedicated Lens Deconvolution (`deconvolution.py`)
+* **Physical PSF Base Anchoring**: Rather than relying on unstable noise-contrast calculations on JPEG quantization floors (which are highly corrupted by in-camera JPEG denoising), Optico maps the Wiener `psf_base` to physical lens focal lengths:
+  * **Focal Length <= 28mm (17mm wide-angle, small faces)** $\to$ $\text{psf\_base} = 0.35$ to prevent face distortion and JPEG artifact overshoot.
+  * **Focal Length = 45mm** $\to$ $\text{psf\_base} = 0.57$.
+  * **Focal Length = 50mm (mid-telephoto, larger faces)** $\to$ $\text{psf\_base} = 0.63$ for maximum resolution retrieval.
+* **Frequency-Dependent Wiener**: Estimates a per-frequency regularization map $K(f)$ directly from the image's own power spectrum via plateau detection. This matches the textbook SNR-inverse Wiener solution.
+* **Grid-Safe PSF Cap**: Caps the auto-estimated PSF sigma so the Wiener filter's passband cannot reach the Drizzle kernel's residual grid-artifact frequency.
+* **Edge Taper**: Applies a cosine taper to image borders before FFT2 to suppress spectral-leakage banding that would otherwise cross smooth regions.
+* **Robust Clamping**: For JPEG inputs, high-contrast edges (e.g. railings vs sky) are clamped using a local neighborhood min-max map to prevent ringing amplification, while preserving linear gradients.
+

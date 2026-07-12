@@ -41,6 +41,158 @@ logger = logging.getLogger(__name__)
 _DITHER_GRID_N: int = 4
 
 
+def _patch_cc(a: np.ndarray, b: np.ndarray, texture_threshold: float = 3.0) -> float:
+    """Normalized cross-correlation between two same-shape patches.
+
+    Returns 1.0 (assume good alignment) when the reference patch has
+    insufficient texture (Sobel energy < texture_threshold per pixel),
+    because NCC is unreliable in flat/uniform regions.
+    """
+    a = a.ravel().astype(np.float64)
+    b = b.ravel().astype(np.float64)
+    # Check reference patch texture via variance
+    if np.std(a) < texture_threshold:
+        return 1.0   # flat patch — assume aligned, don't penalise
+    a -= a.mean()
+    b -= b.mean()
+    denom = np.sqrt(np.dot(a, a) * np.dot(b, b))
+    return float(np.dot(a, b) / denom) if denom > 1e-10 else 1.0
+
+
+def compute_regional_cc(
+    ref_gray: np.ndarray,
+    images: list[np.ndarray],
+    M_list: list[Optional[np.ndarray]],
+    corner_frac: float = 0.20,
+    center_frac: float = 0.30,
+) -> list[dict]:
+    """Compute region-wise CC (center + 4 corners) for each aligned frame.
+
+    After warping each frame to the reference, the CC is measured
+    independently in five spatial regions:
+      - CTR  : central (center_frac × min_dim) square
+      - TL/TR/BL/BR : corner (corner_frac × min_dim) squares
+
+    Parameters
+    ----------
+    ref_gray : np.ndarray  (H, W), uint8 or float
+        Reference frame in grayscale.
+    images : list of np.ndarray  (H, W, 3)
+        All burst frames (BGR uint8).
+    M_list : list of Optional[np.ndarray]
+        Affine transform matrices from alignment (None = rejected).
+    corner_frac : float
+        Fraction of min(H, W) to use as corner patch side length.
+    center_frac : float
+        Fraction of min(H, W) to use as center patch half-size.
+
+    Returns
+    -------
+    list of dict with keys 'cc_center', 'cc_tl', 'cc_tr', 'cc_bl', 'cc_br',
+    'cc_corner_min'.  Reference frame entry has all values = 1.0.
+    """
+    h, w = ref_gray.shape
+    min_dim = min(h, w)
+    cy, cx = h // 2, w // 2
+
+    cs = max(8, int(corner_frac * min_dim))   # corner patch side
+    cm = max(8, int(center_frac * min_dim))   # center half-side
+
+    # Pre-slice reference patches
+    ref_f = ref_gray.astype(np.float32)
+    ref_ctr = ref_f[cy - cm: cy + cm, cx - cm: cx + cm]
+    ref_tl  = ref_f[:cs, :cs]
+    ref_tr  = ref_f[:cs, w - cs:]
+    ref_bl  = ref_f[h - cs:, :cs]
+    ref_br  = ref_f[h - cs:, w - cs:]
+
+    results = []
+    for img, M in zip(images, M_list):
+        if M is None:
+            results.append({
+                'cc_center': 0.0, 'cc_tl': 0.0, 'cc_tr': 0.0,
+                'cc_bl': 0.0, 'cc_br': 0.0, 'cc_corner_min': 0.0,
+            })
+            continue
+
+        img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        warped = cv2.warpAffine(
+            img_gray, M, (w, h),
+            flags=cv2.WARP_INVERSE_MAP | cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT101,
+        ).astype(np.float32)
+
+        cc_ctr = _patch_cc(ref_ctr, warped[cy - cm: cy + cm, cx - cm: cx + cm])
+        cc_tl  = _patch_cc(ref_tl,  warped[:cs, :cs])
+        cc_tr  = _patch_cc(ref_tr,  warped[:cs, w - cs:])
+        cc_bl  = _patch_cc(ref_bl,  warped[h - cs:, :cs])
+        cc_br  = _patch_cc(ref_br,  warped[h - cs:, w - cs:])
+
+        results.append({
+            'cc_center': cc_ctr,
+            'cc_tl': cc_tl,
+            'cc_tr': cc_tr,
+            'cc_bl': cc_bl,
+            'cc_br': cc_br,
+            'cc_corner_min': min(cc_tl, cc_tr, cc_bl, cc_br),
+        })
+
+    return results
+
+
+def build_regional_quality_maps(
+    regional_cc_list: list[dict],
+    h: int,
+    w: int,
+    corner_frac: float = 0.20,
+) -> list[np.ndarray]:
+    """Build per-frame spatial quality weight maps from regional CC scores.
+
+    Bilinearly interpolates the 5 CC anchor values (center + 4 corners)
+    across the full image.  The resulting map is in [0, 1] and represents
+    how well each pixel location is aligned for that frame.
+
+    Frames with uniform CC ≈ 1.0 everywhere (pure translation) get a
+    near-flat map ≈ 1.0.  Frames with low corner CC (camera rotation
+    residual) get a map that tapers toward the corners.
+    """
+    cy, cx = h / 2.0, w / 2.0
+    cs = max(8, int(corner_frac * min(h, w)))
+    # Anchor pixel coordinates (y, x) for the 5 CC values
+    anchors_yx = [
+        (cy,     cx),          # center
+        (cs / 2, cs / 2),      # TL
+        (cs / 2, w - cs / 2),  # TR
+        (h - cs / 2, cs / 2),  # BL
+        (h - cs / 2, w - cs / 2),  # BR
+    ]
+
+    y_grid = np.arange(h, dtype=np.float32)
+    x_grid = np.arange(w, dtype=np.float32)
+    xv, yv = np.meshgrid(x_grid, y_grid)
+
+    maps = []
+    for rcc in regional_cc_list:
+        anchor_vals = [
+            rcc['cc_center'],
+            rcc['cc_tl'],
+            rcc['cc_tr'],
+            rcc['cc_bl'],
+            rcc['cc_br'],
+        ]
+        # Inverse-distance weighted interpolation from the 5 anchors
+        total_w = np.zeros((h, w), dtype=np.float32)
+        total_v = np.zeros((h, w), dtype=np.float32)
+        for (ay, ax), val in zip(anchors_yx, anchor_vals):
+            dist = np.sqrt((xv - ax) ** 2 + (yv - ay) ** 2) + 1e-3
+            w_map = 1.0 / dist
+            total_w += w_map
+            total_v += w_map * float(val)
+        qmap = np.clip(total_v / (total_w + 1e-9), 0.0, 1.0)
+        maps.append(qmap)
+    return maps
+
+
 def _neff_histogram(fx: np.ndarray, fy: np.ndarray) -> float:
     """4×4 histogram Shannon entropy N_eff."""
     hist, _, _ = np.histogram2d(
@@ -239,7 +391,12 @@ def align_images_ecc(
     M_list: list[Optional[np.ndarray]] = []
     cc_list: list[float] = []
 
-    warp_mode = cv2.MOTION_TRANSLATION
+    motion_mode_str = getattr(config, 'ecc_motion_mode', 'affine')
+    if motion_mode_str == 'affine':
+        warp_mode = cv2.MOTION_AFFINE
+    else:
+        warp_mode = cv2.MOTION_TRANSLATION
+
     criteria = (
         cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
         config.ecc_iterations,

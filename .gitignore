@@ -216,3 +216,49 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ================================================================== #
+# Optico Custom Testing & Cache Data (Local Only)
+# ================================================================== #
+/input*
+/output*
+/backend/output/
+/scratch/
+/tests/
+/temp_log.txt
+/models/
+/gfpgan/
+/recovered_files/
+/recovered*.py
+/recover*.py
+/*.jpg
+/*.patch
+/compare_*.jpg
+/side_by_side_*.jpg
+/mfsr_snippets.py
+/backend/test_*.py
+/backend/face_detection_yunet_2023mar.onnx
+/backend/face_protect.py
+/backend/crop_evidence*.py
+/optico-*.py
+/backend/benchmarks/
+/backend/build_exe.ps1
+/dis_main.txt
+/main_dis.txt
+/mfsr_dis.txt
+/app.js
+/worker.js
+/opencv.js
+/style.css
+/node_modules/
+/desktop/
+/frontend/
+
+# ==================================================================
+# Optico Custom Ignored Project Files (Local Only)
+# ==================================================================
+/backend/ai_models.py
+/OPTICO_GITHUB_SWITCHOVER.md
+/serve.ps1
+/CLAUDE.md
+/CONTRIBUTING.md

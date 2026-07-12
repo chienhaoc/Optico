@@ -82,6 +82,19 @@ only marginal further gain below it. This is applied as a cap on the
 *auto*-computed psf_sigma only (not on an explicit --psf-override, which
 remains a raw manual value for experimentation). Full data:
 backend/benchmarks/reports/input{3,4}_kernel_bench.json.
+
+JPEG-only Scheme B local min-max clamping (2026-07)
+----------------------------------------------------
+On JPEG inputs with very high contrast edges (railings vs sky), JPEG DCT
+block compression creates ringing sidelobes that Wiener deconvolution
+amplifies into a visible white border.  Median-based clamping was tested
+and rejected — it produces hard-truncated thin white lines which are more
+visually jarring than the original gradual sidelobe.  A 3×3 dilate/erode
+neighbourhood with 5% margin yields a smooth gradient bound that prevents
+extreme amplification while keeping the natural edge transition.
+
+This clamping is skipped entirely for RAW inputs which do not have JPEG
+DCT compression ringing artifacts.
 """
 import logging
 import time
@@ -393,13 +406,117 @@ def deconvolve_color(
     psf_override: Optional[float] = None,
     jpeg_input: bool = False,
 ) -> np.ndarray:
-    """Apply Wiener deconvolution to a color image (luma channel only)."""
+    """Apply Spatially Adaptive Edge-Aware Wiener deconvolution to a color image.
+
+    Restricts deconvolution to high-frequency edge regions (using a Sobel-derived
+    edge mask) while leaving flat regions un-sharpened. This completely conceals
+    nearest-neighbor and box Drizzle grid artifacts in flat areas, while restoring
+    extreme physical sharpness to edge details (like cooling vents, text, and borders).
+
+    If the image is larger than 25 Megapixels, it automatically splits the image
+    into overlapping chunks (overlap=256px) for memory safety (averts OOM on high scale).
+    """
+    H, W = img_bgr.shape[:2]
+
+    # Helper for luma channel deconvolution
+    def deconvolve_luma_patch(y_patch: np.ndarray) -> np.ndarray:
+        # y_patch: (h, w), float32 in [0, 255]
+        # returns deconvolved luma patch: (h, w), float32 in [0, 255]
+        y_deconv = wiener_deconv(y_patch, scale, psf_override, jpeg_input=jpeg_input)
+        sigma_noise = _estimate_noise_mad(y_patch)
+        sobelx = cv2.Sobel(y_patch, cv2.CV_32F, 1, 0, ksize=3)
+        sobely = cv2.Sobel(y_patch, cv2.CV_32F, 0, 1, ksize=3)
+        grad_mag = np.sqrt(sobelx**2 + sobely**2)
+        threshold = max(3.5 * sigma_noise, 3.0)
+        edge_mask = np.clip((grad_mag - threshold) / threshold, 0.0, 1.0)
+        edge_mask_sm = cv2.GaussianBlur(edge_mask, (5, 5), 1.5)
+
+        y_blended = edge_mask_sm * y_deconv + (1.0 - edge_mask_sm) * y_patch
+
+        # Scheme B: JPEG-only local min-max clamping.
+        #
+        # JPEG DCT block compression creates ringing sidelobes around high-contrast
+        # edges (e.g. railings vs bright sky). Wiener deconvolution amplifies these
+        # sidelobes, producing a visible white border. For RAW inputs this artifact
+        # does not exist, so clamping is skipped entirely to avoid any impact.
+        #
+        # The dilate/erode 3×3 neighbourhood yields a smooth local upper/lower bound
+        # that naturally transitions across the edge — median-based bounds were tested
+        # and rejected because they produce hard-truncated thin white lines which are
+        # more visually jarring than the original gradual sidelobe.
+        if jpeg_input:
+            k3 = np.ones((3, 3), np.uint8)
+            local_max = cv2.dilate(y_patch, k3)
+            local_min = cv2.erode(y_patch, k3)
+            margin = 0.15 * (local_max - local_min)
+            y_blended = np.clip(y_blended, local_min - margin, local_max + margin)
+
+        return y_blended
+
+    # Step 1: Normalize BGR to [0, 1] float32
     img_scaled = (img_bgr / 255.0).astype(np.float32)
     ycrcb_f32 = cv2.cvtColor(img_scaled, cv2.COLOR_BGR2YCrCb)
 
+    # Extract single channel Luma (Y) to save 2/3 memory during patching
     y_scaled = ycrcb_f32[:, :, 0] * 255.0
-    y_deconv = wiener_deconv(y_scaled, scale, psf_override, jpeg_input=jpeg_input)
 
-    ycrcb_f32[:, :, 0] = np.clip(y_deconv, 0.0, 255.0) / 255.0
+    if H * W <= 25_000_000:
+        y_final = deconvolve_luma_patch(y_scaled)
+    else:
+        logger.info(
+            "Image is large (%dx%d = %.1fMP) — using Chunked Wiener Deconvolution (memory safe)",
+            W, H, H * W / 1e6,
+        )
+        chunk_size = 3000
+        overlap = 256
+        y_final = np.zeros_like(y_scaled)
+
+        # Standard size for all patches is exactly 3512x3512
+        standard_size = chunk_size + 2 * overlap
+
+        for y0 in range(0, H, chunk_size):
+            y1 = min(y0 + chunk_size, H)
+            for x0 in range(0, W, chunk_size):
+                x1 = min(x0 + chunk_size, W)
+
+                # Pad margins with overlap
+                pad_y0 = max(0, y0 - overlap)
+                pad_y1 = min(H, y1 + overlap)
+                pad_x0 = max(0, x0 - overlap)
+                pad_x1 = min(W, x1 + overlap)
+
+                # Slice raw patch
+                patch = y_scaled[pad_y0:pad_y1, pad_x0:pad_x1]
+                ph, pw = patch.shape
+
+                # Check if it needs padding to match the standard 3512x3512 size
+                # This is crucial to avoid SciPy FFT planner cache bloat!
+                need_pad = (ph < standard_size) or (pw < standard_size)
+                if need_pad:
+                    pad_h = standard_size - ph
+                    pad_w = standard_size - pw
+                    patch_padded = np.pad(patch, ((0, pad_h), (0, pad_w)), mode='reflect')
+                else:
+                    patch_padded = patch
+
+                # Run deconvolution on standard-size patch
+                patch_deconv_padded = deconvolve_luma_patch(patch_padded)
+
+                # Slice back to original size
+                if need_pad:
+                    patch_deconv = patch_deconv_padded[:ph, :pw]
+                else:
+                    patch_deconv = patch_deconv_padded
+
+                # Crop out overlap margins
+                rel_y0 = y0 - pad_y0
+                rel_y1 = y1 - pad_y0
+                rel_x0 = x0 - pad_x0
+                rel_x1 = x1 - pad_x0
+
+                y_final[y0:y1, x0:x1] = patch_deconv[rel_y0:rel_y1, rel_x0:rel_x1]
+
+    # Combine Luma back into YCrCb and restore BGR
+    ycrcb_f32[:, :, 0] = np.clip(y_final, 0.0, 255.0) / 255.0
     result_scaled = cv2.cvtColor(ycrcb_f32, cv2.COLOR_YCrCb2BGR)
     return result_scaled * 255.0

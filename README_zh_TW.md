@@ -18,11 +18,13 @@ python -m backend.pipeline --input ./burst --output result.png
 | 旗標 | 預設值 | 說明 |
 |---|---|---|
 | `--input` / `-i` | *(必填)* | 連拍影像資料夾 |
-| `--output` / `-o` | `optico_output.png` | 輸出路徑 |
-| `--scale` / `-s` | `2.0` | 目標放大倍率 |
+| `--output` / `-o` | *(自動生成)* | 輸出路徑 |
+| `--scale` / `-s` | `0.0` (自動) | 目標放大倍率 (0.0 = 依據 N_eff 抖動品質自動解算) |
 | `--pixfrac` | `0.7` | Drizzle 像素分率（0–1）|
 | `--chunks` | `8` | Drizzle 記憶體分塊數 |
 | `--no-deconv` | 關 | 跳過 Wiener 反捲積 |
+| `--psf-base` | `0.63` | Wiener 反捲積 PSF 縮放常數（廣角 17mm 設 0.35，長焦 50mm 設 0.63） |
+| `--psf-override` | None | 手動指定 HR 去模糊 PSF 標準差（會跳過縮放與安全上限） |
 | `--align-scale` | 自動 | 覆蓋 ECC 縮放因子 |
 | `--jpeg` | 自動 | 強制 JPEG 模式 |
 | `--raw` | 自動 | 強制 RAW/PNG 模式 |
@@ -30,19 +32,23 @@ python -m backend.pipeline --input ./burst --output result.png
 | `--cache-dir` | `~/.optico_cache` | 自訂快取目錄 |
 | `--verbose` / `-v` | 關 | 開啟 debug 日誌 |
 
-### JPEG vs RAW 處理差異
+### JPEG vs RAW 物理焦距 PSF 定錨
 
-Optico 透過讀取檔案 header（JPEG SOI 標記 `0xFF 0xD8`）自動偵測輸入格式。JPEG 輸入時自動啟用三項調整：
+Optico 透過讀取檔案 header（JPEG SOI 標記 `0xFF 0xD8`）自動偵測輸入格式。JPEG 輸入時自動啟用下列優化：
 
-- **Phase 2 對齊：** ECC 高斯濾波核心從 5 → 7 px，壓制 8×8 DCT inter-block 邊界假梯度，避免次像素偏移估計偏差。
-- **Phase 8 Drizzle：** coverage-hole 填補對所有輸入通用。
-- **Phase 9 反捲積：** PSF sigma ×1.10（複合光學 + JPEG 量化模糊），之後再套用格柵安全上限公式（見下方）；噪聲基準面掃描起點從 0.75 → 0.60 × Nyquist，避免 JPEG 頻率截止帶被誤判為白噪聲，高估噪聲基準導致高頻細節過度壓制。
+- **Phase 2 對齊：** ECC 高斯濾波核心從 5 → 7 px，壓制 8×8 DCT inter-block 邊界。
+- **Phase 8.0 數據端預加重：** 在 Drizzle 疊加投影前先對原始 LR 影格套用殘差高通濾波器（`alpha=0.55`），還原 JPEG 被量化丟失的高頻細節。
+- **Phase 9 反捲積：** 避開不穩定的空間噪訊-對比估計（JPEG 降噪會嚴重扭曲噪訊估算導致過度銳化），改為直接將 `psf_base` 定錨至鏡頭物理焦距：
+  - **焦距 <= 28mm (17mm 超廣角，小人臉)** $\to$ `--psf-base 0.35`（保護小人臉五官不扭曲）。
+  - **焦距 = 45mm** $\to$ `--psf-base 0.57`。
+  - **焦距 = 50mm (50mm 中長焦，人臉大)** $\to$ `--psf-base 0.63`（發揮最高解像力與銳度）。
 
 使用 `--jpeg` 或 `--raw` 可強制覆蓋自動偵測結果。
 
 ### Drizzle 核心選擇
 
-`kernel_mode`（預設 **`lanczos2`**）決定 Phase 8 的累加核心。真實連拍照片基準測試（`backend/benchmarks/kernel_bench.py`）發現舊預設 `box` 的 coverage-hole 格柵瑕疵在真實腳架連拍上確實嚴重存在；`lanczos2` 搭配 Phase 9 自動估計 PSF sigma 的格柵安全上限（避免 Wiener 濾波器放大同一個格柵頻率），同時在振鈴、格柵週期性、leave-one-out 保真度三項指標勝過 `box`——詳見 [CORE_ALGORITHM_zh_TW.md](CORE_ALGORITHM_zh_TW.md) 第 4–5 節與 `backend/benchmarks/reports/` 完整數據。`box`、`lanczos2_clamped`、`box_supersample` 仍可透過 `config.kernel_mode` 選用以供比較。
+`kernel_mode`（預設 **`lanczos4`**，2026-07 變更）決定 Phase 8 的累加核心。`lanczos4` 結合 Phase 9 自動估計 PSF sigma 的格柵安全上限，同時在振鈴、格柵週期性、leave-one-out 保真度三項指標上均有最佳表現。
+
 
 ---
 

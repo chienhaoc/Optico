@@ -61,13 +61,20 @@ graph TD
 * **對齊誤差限制 (CRLB)**：$\text{Limit}_{blur} = \alpha \sqrt{\frac{R_{global}}{1 - R_{global}}}$
 * **最終箝制**：將目標倍率 $S$ 箝制在 $\min(\text{Target}, \text{Limit}_{density}, \text{Limit}_{blur})$ 以內，確保只有在對齊品質良好時才允許拉高解析度。
 
-### 4. Drizzle 疊加 (`drizzle.py`)
+### 4. Drizzle 疊加與快取資料庫 (`drizzle.py`)
 * **向量化投影**：利用 `cv2.warpAffine` 將每幀影像與遮罩同步投影至 HR 畫布，時間複雜度為優異的 $O(N \cdot H \cdot W)$。
 * **記憶體條帶分塊 (Chunking)**：將超解析畫布水平分割。每個分塊完成累加並除以權重後，強制刪除中間高精度矩陣並呼叫 `gc.collect()` 釋放，使峰值記憶體受控。
-* **核心選擇**：`kernel_mode`（預設 **`lanczos2`**，2026-07 變更）決定累加核心。真實連拍照片的基準測試（`backend/benchmarks/kernel_bench.py`）證實舊預設 `box` 的結構性 coverage-hole 格柵瑕疵在真實照片上確實嚴重存在，並非僅是合成邊界案例；`lanczos2` 搭配格柵安全 PSF 上限（見第 5 節）在振鈴、格柵週期性、leave-one-out 保真度三項指標上同時勝過 `box`。`box`、`lanczos2_clamped`（負向 sidelobe 歸零）與 `box_supersample`（超取樣後 area-decimate）仍保留為可選項以供比較。詳見 [CORE_ALGORITHM_zh_TW.md](CORE_ALGORITHM_zh_TW.md) 第 4 節。
+* **Drizzle 快取資料庫**：在 Phase 8 之前對輸入影格位元組、解算出的倍率與配置計算 MD5 簽章。若命中快取，管線會完全跳過對齊與 Drizzle 階段（Phase 2-8），直接自硬碟載入已疊加好的高精度 Drizzle 畫布。
+* **LR 數據端預加重 (Phase 8.0)**：若輸入為 JPEG 影像，在投影前先對原始小圖套用輕微的高頻補償濾波器（`alpha=0.55` 殘差高頻補償），這能大幅提升去模糊後的最終銳度，且能抑制 deconvolution 產生的振鈴白邊。
+* **核心選擇**：`kernel_mode`（預設 **`lanczos4`**，2026-07 變更）決定累加核心。`lanczos4` 搭配格柵安全 PSF 上限在振鈴、格柵週期性、leave-one-out 保真度上表現最優。
 
-### 5. 頻率相依反捲積 (`deconvolution.py`)
-* **動態底噪估計**：在空間域以修正後的 Laplacian MAD 公式 $1.4826 \cdot \text{median}(|\text{Lap}(I) - \text{median}(\text{Lap}(I))|)$ 算出 Drizzle 後的真實物理噪聲標準差。
-* **頻率相依 Wiener**：直接從影像自身功率頻譜以平台偵測估計逐頻率正則化映射 $K(f)$，取代舊版的標量或雙頻段 Canny 混合 $K$（已淘汰，見 [OPTICO_GLOSSARY.md](OPTICO_GLOSSARY.md)）。此法直接對應教科書 SNR-inverse Wiener 解，相較舊版雙頻段方案平均提升 PSNR +1.54 dB。
-* **格柵安全 PSF 上限**：將自動估計的 PSF sigma 上限箝制，避免 Wiener 濾波器的通帶觸及 Drizzle 核心殘留的格柵瑕疵頻率——這正是上方 `lanczos2` 預設變更背後的真實連拍驗證機制。僅作用於自動估計路徑，不影響明確指定的 `--psf-override`。詳見 [CORE_ALGORITHM_zh_TW.md](CORE_ALGORITHM_zh_TW.md) 第 5 節。
+### 5. 專用鏡頭反捲積 (`deconvolution.py`)
+* **物理焦距 PSF 定錨**：為了避免在 JPEG 感光底噪上進行不穩定的噪訊-對比估計（相機內建 JPEG 降噪會大幅扭曲雜訊估算，導致錯判），Optico 將 Wiener `psf_base` 物理參數與鏡頭焦段直接對應：
+  * **焦距 <= 28mm (17mm 超廣角，小人臉)** $\to$ $\text{psf\_base} = 0.35$（溫和對焦，避免小人臉五官因去模糊過強而扭曲或產生粗顆粒）。
+  * **焦距 = 45mm** $\to$ $\text{psf\_base} = 0.57$（中焦平衡）。
+  * **焦距 = 50mm (50mm 中長焦，人臉大)** $\to$ $\text{psf\_base} = 0.63$（極致銳化，發揮最高解像力）。
+* **頻率相依 Wiener**：直接從影像自身功率頻譜以平台偵測估計逐頻率正則化映射 $K(f)$。此法直接對應教科書 SNR-inverse Wiener 解，相較舊版雙頻段方案平均提升 PSNR +1.54 dB。
+* **格柵安全 PSF 上限**：將自動估計的 PSF sigma 上限箝制，避免 Wiener 濾波器的通帶觸及 Drizzle 核心殘留的格柵瑕疵頻率。
 * **邊緣錐化**：FFT2 前對影像邊界套用餘弦漸變窗，抑制原本會貫穿人臉等平滑區域的頻譜洩漏橫帶。
+* **魯棒邊緣箝制**：針對 JPEG 影像，在高對比邊緣（如天際線、欄杆）利用局部鄰域最大最小值進行箝制，防止高頻振鈴被放大，同時保持平滑的線性邊緣梯度。
+

@@ -105,11 +105,18 @@ This is equivalent to bilinear interpolation from surrounding well-covered pixel
 
 ### Kernel Selection (`kernel_mode`)
 
-`box` above has a real, not merely theoretical, failure mode: a real-burst benchmark (`backend/benchmarks/kernel_bench.py`, two Sony A7C tripod bursts, scale=2.0) measured its coverage-hole grid pattern via `grid_periodicity_score` (FFT peak-to-floor ratio at the aliased grid frequency $1/S$) and found it 3-17× worse than the sinc-shaped alternatives below, confirming the coverage-hole fill above does not fully eliminate the underlying periodic ripple.
+* **`lanczos4`** (default, changed 2026-07): windowed sinc kernel, $a=4$ (`_lanczos`, `DRIZZLE_LANCZOS_A`). Every HR pixel receives weight from a window of $8\times8$ pixels. This provides the sharpest high-frequency coverage, which when combined with the grid-safe PSF cap, outperforms both `box` and `lanczos2` on aliasing-resistance, grid-periodicity, and leave-one-out fidelity simultaneously on real Sony A7C bursts.
+- **`lanczos2`**: windowed sinc kernel with $a=2$, softer than `lanczos4`.
+- **`lanczos2_clamped`**: windowed sinc with negative sidelobe weights zeroed.
+- **`box`**: backward nearest-neighbor kernel, subject to grid ripples.
 
-- **`lanczos2`** (default, changed 2026-07): windowed sinc kernel, $a=2$ (`_lanczos`, `DRIZZLE_LANCZOS_A`). Every HR pixel receives positive weight from at least one LR pixel — no structural zeros, hence no periodic coverage-hole grid. Combined with the grid-safe PSF cap (§5), this beat `box` on ringing, grid-periodicity, *and* leave-one-out fidelity simultaneously on both benchmarked real bursts — a genuine improvement, not a trade-off. Full data: `backend/benchmarks/reports/`.
-- **`lanczos2_clamped`**: same footprint as `lanczos2` but negative sidelobe weights are zeroed (`clamp_negative=True`), intended to remove Gibbs-style ringing. Benchmarked but not selected as default: it reduces ringing slightly at matched PSF, but counter-intuitively has *higher* grid_periodicity than plain `lanczos2` at most tested PSF values — clamping the negative lobes does not uniformly improve coverage uniformity.
-- **`box_supersample`**: accumulates with `box` at `DRIZZLE_SUPERSAMPLE_FACTOR`× the requested scale, then area-decimates (`cv2.INTER_AREA`) back down — the standard anti-aliasing strategy of pushing the periodic zeros above Nyquist before a proper low-pass decimation. Benchmarked and discarded: only reduced grid_periodicity by ~30-50% (vs. lanczos2's 3-17×), with no ringing benefit and added compute cost.
+### LR Data-Side Pre-emphasis (Phase 8.0)
+For JPEG inputs, compression quantizes away high-frequency DCT coefficients. To restore edge contrast prior to Drizzle stacking, Optico applies a pre-emphasis high-pass filter to each input LR frame:
+1. **Extract high frequencies:**
+   $$\text{hp}_i = I_{\text{LR}, i} - \text{GaussianBlur}(I_{\text{LR}, i},\ \text{kernel}=3\times3,\ \sigma=0.8)$$
+2. **Apply compensation:**
+   $$I_{\text{pre}, i} = \text{clip}(I_{\text{LR}, i} + \alpha \cdot \text{hp}_i,\ 0,\ 255)$$
+   where $\alpha = 0.55$ represents the pre-emphasis gain. This pre-enhancement increases spatial gradient gradients prior to stacking, which dramatically lowers the regularisation burden during Phase 9 deconvolution.
 
 ---
 
@@ -129,33 +136,20 @@ $$w[i] = \frac{1}{2}\left(1 - \cos\frac{\pi i}{T}\right), \quad i = 0, \ldots, T
 where $T$ = `EDGE_TAPER_WIDTH`. The image mean is subtracted before tapering
 and restored afterwards, preserving the DC component.
 
-**Why JPEG is more affected:** JPEG 8px DCT block boundaries are co-aligned
-across all burst frames. Drizzle stacking reinforces rather than averages them,
-increasing the vertical boundary discontinuity strength beyond that of RAW
-input. Wiener's low/mid-frequency amplification then magnifies the leakage
-bands into clearly visible stripes.
-
-**Sandbox measurement** (512×512 face scene with JPEG block residuals, n=8 runs):
-
-| | Row-mean std | vs input (27.79) |
-|---|---|---|
-| Without taper | 30.76 | +10.7% ← visible banding |
-| **With taper** | **27.66** | **−0.5% ← eliminated** |
-
 ### Noise Estimation
 The global noise floor standard deviation $\sigma_{\text{noise}}$ is estimated from the Laplacian MAD:
 $$\sigma_{\text{noise}} = \frac{1.4826 \cdot \text{MAD}(\nabla^2 I)}{\sqrt{20}}$$
 The $\sqrt{20}$ factor corrects for the 3×3 Laplacian kernel's noise amplification.
 
-### PSF Model
-The optical PSF is modeled as a Gaussian with:
-$$\sigma_{\text{PSF}} = \max(0.4,\ 0.4 \cdot S_{\text{final}})$$
+### Physical Focal-Length PSF Model
+Because in-camera JPEG compression heavily quantizes and denoises flat/dark areas, indirect mathematical estimations of Noise-to-Contrast ratio ($R$) on JPEG inputs suffer from severe quantization blindspots (leading to deconvolution over-sharpening artifacts). Optico bypasses this instability by anchoring the base PSF scale factor directly to the camera's physical lens focal length:
+$$\sigma_{\text{eff}} = \text{psf\_base} \times S_{\text{final}}$$
+where:
+* **Focal Length <= 28mm (17mm ultra-wide, small faces)** $\to$ $\text{psf\_base} = 0.35$ (suppresses artifacts and preserves facial features).
+* **Focal Length = 45mm** $\to$ $\text{psf\_base} = 0.57$.
+* **Focal Length = 50mm (mid-telephoto, larger faces)** $\to$ $\text{psf\_base} = 0.63$ (maximizes resolution and edge contrast).
 
-**JPEG correction:** JPEG quantisation adds a blur PSF ($\sigma_{\text{JPEG}} \approx 0.3\text{–}0.5\ \text{px}$) on top of the optical PSF. The composite effective sigma is:
-$$\sigma_{\text{eff}} = \sqrt{\sigma_{\text{optical}}^2 + \sigma_{\text{JPEG}}^2} \approx \sigma_{\text{optical}} \times 1.35$$
-For JPEG input, `psf_sigma` is multiplied by `JPEG_PSF_SCALE_FACTOR`. This was lowered from `1.35` to `1.10` (2026-07): the 1.35 composite-blur estimate over-stated the true PSF, causing excessive inverse-filter gain near the cutoff frequency and ~3px-wide undershoot bands after high-contrast edges (sandbox: post-edge undershoot −8.74 → −5.61 ADU, PSNR +0.83 dB at high contrast). `1.10` still compensates for real JPEG quantisation blur while keeping overshoot below visual threshold.
-
-**Manual override:** Use `--psf-override <sigma_hr>` to supply the PSF sigma directly **in HR pixels** — this is a deliberate convention (see `pipeline.py`'s module docstring): the value is used as-is and is *not* rescaled by `final_scale` downstream, unlike the auto-estimated path above. An explicit override also bypasses the grid-safe cap described next, so it remains a raw value for controlled experimentation (e.g. `backend/benchmarks/kernel_bench.py --psf-override`). Recommended for telephoto lenses, when default auto-estimation under- or over-corrects blur, or for benchmarking.
+**Manual Override:** Use `--psf-base <val>` to manually specify the base PSF scale factor (e.g. `--psf-base 0.45`), or `--psf-override <sigma_hr>` to supply the raw PSF sigma directly in HR pixels (bypassing scale factors and the grid-safe cap entirely).
 
 ### Grid-Safe PSF Sigma Cap
 

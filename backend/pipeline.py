@@ -92,11 +92,14 @@ from .constants import (
     PSF_SIGMA_MIN,
     PSF_SIGMA_SCALE,
     EDGE_TAPER_WIDTH,
+    DEFAULT_PIXFRAC,
 )
 from .alignment import (
     align_images_ecc,
     calculate_dither_quality_neff,
     select_reference_frame,
+    compute_regional_cc,
+    build_regional_quality_maps,
 )
 from .masking import calculate_dynamic_mask, calculate_retained_ratio
 from .preflight import resolve_final_scale
@@ -112,6 +115,12 @@ from .cache import (
 logger = logging.getLogger(__name__)
 
 OPTICO_VERSION = "1.1.0"  # bump when cache format or algorithm changes
+
+# Sentinel value for target_scale: derive from valid frame count after alignment.
+# > 10 valid frames → 2.4x, > 8 → 2.2x, > 6 → 2.0x, ≤ 6 → 1.4x fallback.
+AUTO_SCALE = 0.0
+
+DEFAULT_OUTPUT_DIR = "backend/output"
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +317,68 @@ def _write_exif(
         logger.warning("EXIF write failed (non-fatal): %s", exc)
 
 
+def _copy_exif_from_source(source_path: Path, output_path: str) -> None:
+    """Copy all EXIF metadata from the original reference frame to the output JPEG.
+
+    This preserves camera metadata (focal length, shutter speed, ISO, GPS, etc.)
+    so the output behaves like a normal photograph in any viewer or DAM system.
+    Called unconditionally; the Optico-specific EXIF params are written
+    separately and only when ``debug=True``.
+
+    Parameters
+    ----------
+    source_path : Path
+        Reference frame whose EXIF to copy.
+    output_path : str
+        Already-saved output JPEG to insert EXIF into.
+    """
+    if Path(output_path).suffix.lower() not in (".jpg", ".jpeg"):
+        return
+    try:
+        import piexif
+    except ImportError:
+        logger.debug("piexif not installed — skipping source EXIF copy")
+        return
+    try:
+        src_exif = piexif.load(str(source_path))
+        exif_bytes = piexif.dump(src_exif)
+        piexif.insert(exif_bytes, output_path)
+        logger.info(
+            "EXIF copied from %s → %s",
+            source_path.name, Path(output_path).name,
+        )
+    except Exception as exc:
+        logger.warning("Source EXIF copy failed (non-fatal): %s", exc)
+
+
+def _auto_scale_from_frame_count(n_valid: int) -> float:
+    """Derive the optimal MFSR upscale factor from the number of valid frames.
+
+    Based on information-theoretic frame diversity requirements:
+      > 10 valid frames → 2.4x  (138 MP from 24 MP sensor)
+      >  8 valid frames → 2.2x
+      >  6 valid frames → 2.0x
+      ≤  6 valid frames → 1.4x  (safe minimum for meaningful SR)
+
+    Parameters
+    ----------
+    n_valid : int
+        Number of frames that passed alignment and CC quality filtering.
+
+    Returns
+    -------
+    float
+        Recommended upscale factor.
+    """
+    if n_valid > 10:
+        return 2.4
+    if n_valid > 8:
+        return 2.2
+    if n_valid > 6:
+        return 2.0
+    return 1.4
+
+
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
@@ -319,6 +390,7 @@ def run_pipeline(
     image_paths: Optional[list[Path]] = None,
     use_cache: bool = True,
     cache_dir: Path = DEFAULT_CACHE_DIR,
+    debug: bool = False,
 ) -> np.ndarray:
     """Run the complete Optico MFSR pipeline.
 
@@ -329,9 +401,12 @@ def run_pipeline(
     config : OpticoConfig, optional
         Pipeline configuration. Uses defaults if None.
     output_path : str, optional
-        If provided, saves the result to this path.  When the output is
-        a JPEG file, pipeline parameters are embedded into EXIF metadata
-        (requires piexif; silently skipped if not installed).
+        Output file path.  When ``None`` and ``image_paths`` is provided,
+        the path is auto-derived from the reference frame's filename and
+        saved to ``backend/output/<refname>.jpg``.
+        Original camera EXIF is always copied from the reference frame.
+        Optico pipeline parameters are written into EXIF only when
+        ``debug=True``.
     image_paths : list[Path], optional
         File paths corresponding to `images`. Required for cache lookup
         and JPEG auto-detection.  If None, both are disabled.
@@ -339,6 +414,10 @@ def run_pipeline(
         If False, skip cache lookup and always recompute Phases 2-8.
     cache_dir : Path
         Root directory for the on-disk Drizzle cache.
+    debug : bool
+        When True, write Optico pipeline parameters (scale, PSF, frames…)
+        into the output JPEG's EXIF UserComment field.  When False (default),
+        only the original camera EXIF from the reference frame is kept.
 
     Returns
     -------
@@ -350,6 +429,9 @@ def run_pipeline(
     psf_override unit: config.psf_override is interpreted as **HR pixels**.
     It is passed unchanged to deconvolve_color and then to wiener_deconv,
     which uses it as an absolute HR-pixel PSF sigma.
+
+    target_scale == AUTO_SCALE (0.0): derive the scale from the valid frame
+    count after alignment — >10→2.4x, >8→2.2x, >6→2.0x, else→1.4x.
     """
     if config is None:
         config = OpticoConfig()
@@ -360,6 +442,7 @@ def run_pipeline(
     t_start = time.time()
     n = len(images)
     lr_h, lr_w = images[0].shape[:2]
+
 
     logger.info("=" * 60)
     logger.info("Optico MFSR Pipeline v%s", OPTICO_VERSION)
@@ -409,6 +492,7 @@ def run_pipeline(
     drizzle_result = None
     cache_key = None
     cache_hit = False
+    ref_idx = 0  # default; overridden in Phase 3 when running full pipeline
 
     if use_cache and image_paths is not None:
         logger.info("-- Cache: Computing cache key (hashing input files)... --")
@@ -465,6 +549,63 @@ def run_pipeline(
             logger.info("-- Phase 4: Skipping Re-alignment (Coarse reference is optimal) --")
             M_list = M_list_initial
 
+        # -- Phase 4.5: Frame Quality Filtering --
+        min_cc = getattr(config, 'frame_cc_threshold', 0.0)
+        before = sum(1 for m in M_list if m is not None)
+
+        if min_cc == 0.0:
+            # Enable Adaptive MAD Outlier Rejection by default
+            valid_cc = np.array([cc for cc, m in zip(cc_list, M_list) if m is not None])
+            if len(valid_cc) > 2:
+                median_cc = np.median(valid_cc)
+                mad = np.median(np.abs(valid_cc - median_cc))
+                sigma = 1.4826 * mad
+                # Strict Z-score threshold = 1.2 to eliminate alignment residuals
+                z_scores = (valid_cc - median_cc) / (sigma + 1e-9)
+
+                idx_valid = 0
+                for i, m in enumerate(M_list):
+                    if m is not None:
+                        z = z_scores[idx_valid]
+                        cc_val = cc_list[i]
+                        # Ref frame is always kept
+                        if i != ref_idx and (z < -1.2 or cc_val < 0.5):
+                            M_list[i] = None
+                            cc_list[i] = 0.0
+                        idx_valid += 1
+                after = sum(1 for m in M_list if m is not None)
+                logger.info(
+                    "-- Phase 4.5: Adaptive MAD Filter (threshold=1.2, median=%.4f, sigma=%.6f) -- kept %d/%d frames --",
+                    median_cc, sigma, after, before,
+                )
+        elif min_cc > 0.0:
+            # Downward compatibility: Hard gap filtering
+            valid_cc = [cc for cc, m in zip(cc_list, M_list) if m is not None]
+            if valid_cc:
+                cc_ref = max(valid_cc)  # best frame CC
+                abs_threshold = cc_ref - min_cc
+                for i, (cc, m) in enumerate(zip(cc_list, M_list)):
+                    if m is not None and i != ref_idx and cc < abs_threshold:
+                        M_list[i] = None
+                        cc_list[i] = 0.0
+                after = sum(1 for m in M_list if m is not None)
+                logger.info(
+                    "-- Phase 4.5: Hard CC Gap Filter (min_cc_gap=%.4f, abs_threshold=%.4f) "
+                    "-- kept %d/%d frames --",
+                    min_cc, abs_threshold, after, before,
+                )
+
+        # -- Auto-scale: derive target scale from valid frame count --
+        if config.target_scale == AUTO_SCALE:
+            valid_now = sum(1 for m in M_list if m is not None)
+            auto_s = _auto_scale_from_frame_count(valid_now)
+            from dataclasses import replace as dc_replace
+            config = dc_replace(config, target_scale=auto_s)
+            logger.info(
+                "-- Auto-scale: %d valid frames → %.1fx --",
+                valid_now, auto_s,
+            )
+
         # -- Phase 5: Dither Quality Assessment --
         logger.info("-- Phase 5: Dither Quality Assessment (N_eff entropy) --")
         dither_neff = calculate_dither_quality_neff(M_list)
@@ -475,6 +616,36 @@ def run_pipeline(
         weight_maps = calculate_dynamic_mask(
             images, M_list, ref_idx=ref_idx, config=config
         )
+
+        # -- Phase 6.5: Regional CC Spatial Quality Weighting --
+        # Compute per-frame CC for center + 4 corner regions.
+        # For frames with rotation-induced corner misalignment, this builds
+        # a smooth spatial weight map that tapers near the corners, so those
+        # frames contribute less where they are poorly aligned.
+        ref_gray_full = cv2.cvtColor(images[ref_idx], cv2.COLOR_BGR2GRAY)
+        regional_cc_list = compute_regional_cc(
+            ref_gray_full, images, M_list,
+            corner_frac=0.20, center_frac=0.30,
+        )
+        lr_h_local, lr_w_local = images[0].shape[:2]
+        quality_maps = build_regional_quality_maps(
+            regional_cc_list, lr_h_local, lr_w_local, corner_frac=0.20,
+        )
+        # Log regional CC summary
+        for i, rcc in enumerate(regional_cc_list):
+            if M_list[i] is not None:
+                logger.debug(
+                    "Frame %d regional CC: center=%.4f TL=%.4f TR=%.4f "
+                    "BL=%.4f BR=%.4f corner_min=%.4f",
+                    i, rcc['cc_center'], rcc['cc_tl'], rcc['cc_tr'],
+                    rcc['cc_bl'], rcc['cc_br'], rcc['cc_corner_min'],
+                )
+        # Multiply motion mask by spatial quality map
+        weight_maps = [
+            (wm * qm).astype(np.float32)
+            for wm, qm in zip(weight_maps, quality_maps)
+        ]
+        logger.info("-- Phase 6.5: Regional CC spatial weighting applied --")
 
         # -- Phase 7: Pre-flight Scale Bounding --
         logger.info("-- Phase 7: Pre-flight Scale Bounding --")
@@ -490,10 +661,37 @@ def run_pipeline(
             config=config,
         )
 
+        # -- Conjugate Drizzle Pre-compensation: Scale-Adaptive Pixfrac --
+        # If pixfrac is not manually overridden, adjust it inversely with scale
+        # to ensure that the physical footprint of Drizzle points projected onto
+        # the HR canvas remains constant, matching the fixed post-deconv PSF.
+        if config.pixfrac == DEFAULT_PIXFRAC:
+            adaptive_pixfrac = np.clip(0.70 * (2.0 / final_scale), 0.40, 1.00)
+            from dataclasses import replace as dc_replace
+            config = dc_replace(config, pixfrac=float(adaptive_pixfrac))
+            logger.info(
+                "-- Drizzle Pre-compensation: scale=%.2f → adaptive pixfrac=%.2f --",
+                final_scale, config.pixfrac,
+            )
+
+        # -- Drizzle Pre-emphasis (LR Data-Side Pre-filtering) --
+        # Pre-emphasize high frequencies in LR space for JPEG inputs to compensate blur early.
+        # This keeps deconv PSF safe at a unified 0.88, avoiding Ringing and Clamping loss.
+        drizzle_images = images
+        if config.jpeg_input:
+            logger.info("-- Drizzle Pre-emphasis: Applying LR high-pass pre-filter (alpha=0.55) --")
+            drizzle_images = []
+            for img in images:
+                img_f = img.astype(np.float32)
+                blur = cv2.GaussianBlur(img_f, (3, 3), 0.8)
+                hp = img_f - blur
+                emp = np.clip(img_f + 0.55 * hp, 0, 255).astype(np.uint8)
+                drizzle_images.append(emp)
+
         # -- Phase 8: Drizzle Stacking --
         logger.info("-- Phase 8: Drizzle Stacking --")
         hr_image = drizzle_stack(
-            images, M_list, weight_maps,
+            drizzle_images, M_list, weight_maps,
             scale=final_scale, ref_idx=ref_idx, config=config,
         )
 
@@ -510,19 +708,14 @@ def run_pipeline(
                 cache_dir=cache_dir,
             )
 
-    # ------------------------------------------------------------------ #
-    # Phase 9: Adaptive Wiener Deconvolution                              #
-    # ------------------------------------------------------------------ #
-    # Compute the effective PSF sigma in HR pixels for EXIF logging.
+    PHYSICAL_PSF_BASE = config.psf_base
+
     if config.psf_override is not None:
-        psf_sigma_hr_log = round(config.psf_override, 4)
+        effective_psf = config.psf_override
     else:
-        base_sigma = max(PSF_SIGMA_MIN, PSF_SIGMA_SCALE * final_scale)
-        if config.jpeg_input:
-            psf_sigma_hr_log = round(base_sigma * JPEG_PSF_SCALE_FACTOR, 4)
-        else:
-            psf_sigma_hr_log = round(base_sigma, 4)
-        psf_override_hr = None
+        effective_psf = PHYSICAL_PSF_BASE * final_scale
+
+    psf_sigma_hr_log = round(effective_psf, 4)
 
     noise_hf_fraction = (
         JPEG_NOISE_FLOOR_HIGH_FREQ_FRACTION
@@ -531,11 +724,10 @@ def run_pipeline(
     )
 
     if not config.skip_deconv:
-        if config.psf_override is not None:
-            logger.info(
-                "Phase 9: psf_override %.3f HR px (scale=%.2f)",
-                config.psf_override, final_scale,
-            )
+        logger.info(
+            "Phase 9: Lens PSF Anchor %.3f HR px (scale=%.2f, jpeg_input=%s)",
+            effective_psf, final_scale, config.jpeg_input,
+        )
 
         logger.info(
             "-- Phase 9: Adaptive Wiener Deconvolution (jpeg_input=%s) --",
@@ -544,9 +736,11 @@ def run_pipeline(
         hr_image = deconvolve_color(
             hr_image,
             scale=final_scale,
-            psf_override=config.psf_override,
+            psf_override=effective_psf,
             jpeg_input=bool(config.jpeg_input),
         )
+
+
     else:
         logger.info("-- Phase 9: Skipped Deconvolution (skip_deconv=True) --")
 
@@ -572,13 +766,26 @@ def run_pipeline(
     logger.info("  Total time: %.1fs", elapsed)
     logger.info("=" * 60)
 
+    # Auto-derive output path from reference frame filename when not given
+    if output_path is None and image_paths is not None:
+        ref_path = image_paths[ref_idx]
+        out_dir = Path(DEFAULT_OUTPUT_DIR)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        output_path = str(out_dir / (ref_path.stem + ".jpg"))
+        logger.info("Auto output path: %s", output_path)
+
     if output_path:
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
         cv2.imwrite(output_path, result)
         logger.info("Saved result to %s", output_path)
 
-        # Embed pipeline parameters into JPEG EXIF
-        exif_params = {
+        # Always copy original camera EXIF from the reference frame
+        if image_paths is not None:
+            _copy_exif_from_source(image_paths[ref_idx], output_path)
+
+        # Write Optico pipeline parameters into EXIF only in debug mode
+        if debug:
+            exif_params = {
             "optico_version": OPTICO_VERSION,
             "frames": n,
             "lr_w": lr_w,
@@ -597,7 +804,7 @@ def run_pipeline(
             "cache_hit": cache_hit,
             "processing_time_s": elapsed,
         }
-        _write_exif(output_path, exif_params)
+            _write_exif(output_path, exif_params)
 
     return result
 
@@ -624,12 +831,20 @@ def main() -> None:
         help="Directory containing burst images",
     )
     parser.add_argument(
-        "--output", "-o", default="optico_output.jpg",
-        help="Output file path (default: optico_output.jpg)",
+        "--output", "-o", default=None,
+        help=(
+            "Output file path. When omitted, the output is saved to "
+            f"backend/output/<ref_frame_name>.jpg (derived from the "
+            "reference frame filename)."
+        ),
     )
     parser.add_argument(
-        "--scale", "-s", type=float, default=2.0,
-        help="Target upscale factor (default: 2.0)",
+        "--scale", "-s", type=float, default=AUTO_SCALE,
+        help=(
+            "Target upscale factor. When omitted (default: auto), the factor "
+            "is determined by the number of valid frames after alignment: "
+            ">10→2.4x, >8→2.2x, >6→2.0x, ≤6→1.4x."
+        ),
     )
     parser.add_argument(
         "--pixfrac", type=float, default=0.7,
@@ -667,6 +882,10 @@ def main() -> None:
             "0.8 HR-pixel PSF to the deconvolution."
         ),
     )
+    parser.add_argument(
+        "--psf-base", type=float, default=0.63,
+        help="Wiener deconvolution base PSF scale factor. effective_psf = psf_base * Scale. (default: 0.63)",
+    )
 
     # JPEG / RAW override flags
     jpeg_group = parser.add_mutually_exclusive_group()
@@ -680,8 +899,32 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--kernel-mode", choices=["lanczos2", "nearest", "bilinear", "lanczos4", "box", "lanczos2_clamped", "box_supersample"],
+        default=None,
+        help="Drizzle kernel mode (default: lanczos2)",
+    )
+    parser.add_argument(
+        "--motion-mode", choices=["translation", "affine"],
+        default="affine",
+        help="ECC alignment motion model (default: affine)",
+    )
+    parser.add_argument(
+        "--min-cc", type=float, default=0.0, metavar="GAP",
+        help="Drop frames whose CC score is more than GAP below the best frame's CC. "
+             "0.0 = keep all (default). Typical: 0.003-0.010. "
+             "Higher = stricter, fewer frames, sharper corners.",
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true",
         help="Enable debug logging",
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help=(
+            "Write Optico pipeline parameters (scale, PSF, frames, timing…) "
+            "into the output JPEG EXIF UserComment field. When omitted (default), "
+            "only the original camera EXIF from the reference frame is preserved."
+        ),
     )
 
     args = parser.parse_args()
@@ -698,11 +941,18 @@ def main() -> None:
         pixfrac=args.pixfrac,
         num_chunks=args.chunks,
         skip_deconv=args.no_deconv,
+        psf_base=args.psf_base,
     )
     if args.align_scale is not None:
         config_kwargs["align_scale"] = args.align_scale
     if args.psf_override is not None:
         config_kwargs["psf_override"] = args.psf_override
+    if args.kernel_mode is not None:
+        config_kwargs["kernel_mode"] = args.kernel_mode
+    if args.motion_mode is not None:
+        config_kwargs["ecc_motion_mode"] = args.motion_mode
+    if args.min_cc > 0.0:
+        config_kwargs["frame_cc_threshold"] = args.min_cc
     if args.jpeg:
         config_kwargs["jpeg_input"] = True
     elif args.raw:
@@ -721,6 +971,7 @@ def main() -> None:
             image_paths=image_paths,
             use_cache=not args.no_cache,
             cache_dir=cache_dir,
+            debug=args.debug,
         )
     except (FileNotFoundError, ValueError) as e:
         logger.error(str(e))

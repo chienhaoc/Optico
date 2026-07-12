@@ -99,6 +99,15 @@ def calculate_dynamic_mask(
     )
     denom = noise_std + config.gradient_weight * grad + 1.0
 
+    # Compute normalized radial distance from image center to scale corner thresholds
+    # Camera rotation and radial distortion cause larger displacement residuals in corners
+    cy, cx = h / 2.0, w / 2.0
+    y_grid, x_grid = np.ogrid[:h, :w]
+    r_map = np.sqrt((x_grid - cx)**2 + (y_grid - cy)**2)
+    r_max = np.sqrt(cx**2 + cy**2)
+    r_norm = (r_map / r_max).astype(np.float32)
+    thresh_mult = 1.0 + 1.5 * r_norm
+
     kernel_bg = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE, (bg_kern, bg_kern)
     )
@@ -122,10 +131,10 @@ def calculate_dynamic_mask(
         diff = np.abs(warped.astype(np.float32) - ref_gray)
         norm_diff = diff / denom
 
-        bg_motion = (norm_diff > config.bg_threshold).astype(np.uint8)
+        bg_motion = (norm_diff > (config.bg_threshold * thresh_mult)).astype(np.uint8)
         bg_motion = cv2.dilate(bg_motion, kernel_bg, iterations=1)
 
-        subj_motion = (norm_diff > config.subj_threshold).astype(np.uint8)
+        subj_motion = (norm_diff > (config.subj_threshold * thresh_mult)).astype(np.uint8)
         subj_motion = cv2.dilate(
             subj_motion, kernel_subj,
             iterations=SUBJ_DILATE_ITERATIONS,

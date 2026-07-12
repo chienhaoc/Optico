@@ -18,11 +18,13 @@ python -m backend.pipeline --input ./burst --output result.png
 | Flag | Default | Description |
 |---|---|---|
 | `--input` / `-i` | *(required)* | Directory of burst images |
-| `--output` / `-o` | `optico_output.png` | Output file path |
-| `--scale` / `-s` | `2.0` | Target upscale factor |
+| `--output` / `-o` | *(auto-derived)* | Output file path |
+| `--scale` / `-s` | `0.0` (auto) | Target upscale factor (0.0 = auto-resolve from dither quality) |
 | `--pixfrac` | `0.7` | Drizzle pixel fraction (0–1) |
 | `--chunks` | `8` | Memory chunks for Drizzle |
 | `--no-deconv` | off | Skip Wiener deconvolution |
+| `--psf-base` | `0.63` | Wiener deconvolution base PSF scale factor (e.g. 0.35 for 17mm, 0.63 for 50mm) |
+| `--psf-override` | None | Direct HR-pixel PSF sigma override (bypasses scale and cap) |
 | `--align-scale` | auto | Override ECC downscale factor |
 | `--jpeg` | auto | Force JPEG-mode processing |
 | `--raw` | auto | Force RAW/PNG-mode processing |
@@ -30,19 +32,23 @@ python -m backend.pipeline --input ./burst --output result.png
 | `--cache-dir` | `~/.optico_cache` | Custom cache directory |
 | `--verbose` / `-v` | off | Debug logging |
 
-### JPEG vs RAW
+### JPEG vs RAW & Focal-Length Dedicated PSF
 
-Optico auto-detects input format by reading file headers (JPEG SOI marker `0xFF 0xD8`). JPEG input activates three automatic adjustments:
+Optico auto-detects input format by reading file headers (JPEG SOI marker `0xFF 0xD8`). JPEG input activates automatic adjustments:
 
-- **Phase 2 alignment:** ECC Gaussian filter enlarged 5 → 7 px to suppress 8×8 DCT inter-block edges that bias sub-pixel offset estimation.
-- **Phase 8 Drizzle:** coverage-hole fill active for all inputs.
-- **Phase 9 deconvolution:** PSF sigma ×1.10 (composite optical + JPEG quantisation blur), then capped by a grid-safe formula (see below) before use; noise-floor scan range lowered from 0.75 → 0.60 × Nyquist to avoid JPEG spectral cutoff inflating the noise estimate.
+- **Phase 2 alignment:** ECC Gaussian filter enlarged 5 → 7 px to suppress 8×8 DCT inter-block edges.
+- **Phase 8.0 Drizzle Pre-emphasis:** Applies a high-pass residual filter ($\alpha = 0.55$) to LR frames prior to stacking to restore quantized high-frequency details.
+- **Phase 9 deconvolution:** Bypasses unstable noise-contrast calculations on JPEG quantization floors and anchors the `psf_base` directly to physical focal lengths:
+  - **Focal Length <= 28mm (17mm wide-angle, small faces)** $\to$ `--psf-base 0.35` (to protect small facial details from over-sharpening).
+  - **Focal Length = 45mm** $\to$ `--psf-base 0.57`.
+  - **Focal Length = 50mm (mid-telephoto, larger faces)** $\to$ `--psf-base 0.63` (for maximum detail retrieval).
 
 Use `--jpeg` or `--raw` to override auto-detection.
 
 ### Drizzle Kernel
 
-`kernel_mode` (default **`lanczos2`**) selects Phase 8's accumulation kernel. A real-burst benchmark (`backend/benchmarks/kernel_bench.py`) found the previous `box` default's coverage-hole grid artifact is real and severe on actual tripod bursts; `lanczos2`, combined with a grid-safe cap on the auto-estimated Phase 9 PSF sigma (which prevents the Wiener filter from amplifying that same grid frequency), beat `box` on ringing, grid-periodicity, and leave-one-out fidelity simultaneously — see [CORE_ALGORITHM.md](CORE_ALGORITHM.md) §4–5 and `backend/benchmarks/reports/` for the full data. `box`, `lanczos2_clamped`, and `box_supersample` remain selectable via `config.kernel_mode` for comparison.
+`kernel_mode` (default **`lanczos4`**, changed 2026-07) selects Phase 8's accumulation kernel. `lanczos4`, combined with a grid-safe cap on the auto-estimated Phase 9 PSF sigma (which prevents the Wiener filter from amplifying the Drizzle kernel's grid frequency), beats `box` and `lanczos2` on ringing, grid-periodicity, and leave-one-out fidelity simultaneously on real Sony A7C bursts.
+
 
 ---
 
