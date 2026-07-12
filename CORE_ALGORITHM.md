@@ -71,7 +71,9 @@ The theoretical resolution limit is bounded by two physical constraints:
    $$S_{\text{density}} = \sqrt{N \cdot R_{\text{global}}}$$
 2. **Alignment Blur Limit (CRLB):** using $N_{\text{eff}}$ as the dither quality measure:
    $$S_{\text{blur}} = \alpha \cdot \sqrt{N_{\text{eff}}}$$
-   where $\alpha = 0.75$ is the optical decay constant.
+   where $\alpha$ is the adaptive decay factor. Instead of a hard constant, $\alpha$ scales adaptively between `OPTICAL_DECAY_CONSTANT` (0.75) and `OPTICAL_DECAY_MAX` (0.90) based on alignment quality (`cc_mean`):
+$$\alpha_{\text{adaptive}} = \text{clip}\left(0.75 + \frac{\text{cc\_mean} - 0.85}{0.98 - 0.85} \times (0.90 - 0.75),\ 0.75,\ 0.90\right)$$
+This ensures that tighter alignment allows for higher upscale bounds.
 
 The final scale factor is:
 $$S_{\text{final}} = \min(S_{\text{target}},\ S_{\text{density}},\ S_{\text{blur}})$$
@@ -109,14 +111,6 @@ This is equivalent to bilinear interpolation from surrounding well-covered pixel
 - **`lanczos2`**: windowed sinc kernel with $a=2$, softer than `lanczos4`.
 - **`lanczos2_clamped`**: windowed sinc with negative sidelobe weights zeroed.
 - **`box`**: backward nearest-neighbor kernel, subject to grid ripples.
-
-### LR Data-Side Pre-emphasis (Phase 8.0)
-For JPEG inputs, compression quantizes away high-frequency DCT coefficients. To restore edge contrast prior to Drizzle stacking, Optico applies a pre-emphasis high-pass filter to each input LR frame:
-1. **Extract high frequencies:**
-   $$\text{hp}_i = I_{\text{LR}, i} - \text{GaussianBlur}(I_{\text{LR}, i},\ \text{kernel}=3\times3,\ \sigma=0.8)$$
-2. **Apply compensation:**
-   $$I_{\text{pre}, i} = \text{clip}(I_{\text{LR}, i} + \alpha \cdot \text{hp}_i,\ 0,\ 255)$$
-   where $\alpha = 0.55$ represents the pre-emphasis gain. This pre-enhancement increases spatial gradient gradients prior to stacking, which dramatically lowers the regularisation burden during Phase 9 deconvolution.
 
 ---
 

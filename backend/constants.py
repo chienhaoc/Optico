@@ -104,9 +104,9 @@ DEFAULT_PIXFRAC: float = 0.7
 DEFAULT_NUM_CHUNKS: int = 8
 DRIZZLE_WEIGHT_FLOOR: float = 1e-6
 
-DRIZZLE_KERNEL_MODE: str = 'lanczos2'
-"""Default drizzle accumulation kernel: 'lanczos2' (validated), 'nearest', 'bilinear',
-'lanczos4', 'box', 'lanczos2_clamped', or 'box_supersample'.
+DRIZZLE_KERNEL_MODE: str = 'lanczos4'
+"""Default drizzle accumulation kernel: 'lanczos4' (validated), 'nearest', 'bilinear',
+'lanczos2', 'box', 'lanczos2_clamped', or 'box_supersample'.
 
 Changed to 'lanczos2' (2026-07, real-burst benchmark): the 2026-07 revert
 to 'box' below was validated only on synthetic data. A real-burst

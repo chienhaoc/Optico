@@ -94,13 +94,7 @@ $$r_{\text{drop}} = \frac{p \cdot S}{2}, \quad p = \text{pixfrac} \in [0,1]$$
 - **`lanczos2_clamped`**：windowed sinc，負向 sidelobe 權重歸零。
 - **`box`**：反向鄰域核心，容易在手持連拍中產生網格紋路。
 
-### LR 數據端預加重 (Phase 8.0)
-針對 JPEG 輸入影像，相機壓縮會將高頻 DCT 係數歸零。為了在 Drizzle 疊加之前還原邊緣對比度，Optico 對每個輸入的原始 LR 影格套用一個預加重高通濾波器：
-1. **提取高頻分量：**
-   $$\text{hp}_i = I_{\text{LR}, i} - \text{GaussianBlur}(I_{\text{LR}, i},\ \text{kernel}=3\times3,\ \sigma=0.8)$$
-2. **套用殘差補償：**
-   $$I_{\text{pre}, i} = \text{clip}(I_{\text{LR}, i} + \alpha \cdot \text{hp}_i,\ 0,\ 255)$$
-   其中 $\alpha = 0.55$ 為預加重增益。這個前向補償在疊加前拉高了像素級的局部梯度，能大幅減輕 Phase 9 反捲積時的正則化壓力，進而防止振鈴白邊的產生。
+
 
 分塊累加：
 $$\text{Num}(x,y) = \sum_{i=1}^N \text{overlap}_i(x,y) \cdot W_i(x,y) \cdot I_i(x,y)$$
@@ -148,7 +142,7 @@ $$\sigma_{\text{noise}} = \frac{1.4826 \cdot \text{MAD}(\nabla^2 I)}{\sqrt{20}}$
 $\sqrt{20}$ 係數補正 3×3 Laplacian 算子的噪聲放大效應。
 
 ### 物理焦距 PSF 定錨模型
-由於相機內置 JPEG 引擎會進行強力的降噪與塗抹，任何在空間域估計的噪訊-對比比值 $R$ 都會遭遇嚴重的 JPEG 量化盲區，造成錯判並產生嚴重的過度銳化斑點。Optico 通過將去模糊的 PSF 基底常數直接與相機鏡頭的物理焦段進行定錨來解決此不穩定性：
+由於相機內置 JPEG 引擎會進行強力的降噪與塗抹，任何在空間域估計的噪訊-對比比值 $R$ 都會遭遇嚴重的 JPEG 量化盲區，造成錯判並產生嚴重的過度銳化斑點。Optico 通過讓用戶利用命令列參數 `--psf-base` 手動將去模糊的 PSF 基底常數與相機鏡頭的物理焦段進行定錨，來解決此不穩定性：
 $$\sigma_{\text{eff}} = \text{psf\_base} \times S_{\text{final}}$$
 Point-level anchor:
 * **焦距 <= 28mm (17mm 超廣角，小人臉)** $\to$ $\text{psf\_base} = 0.35$（溫和保護人臉五官，避免小人臉五官因去模糊過強而扭曲與產生粗顆粒）。

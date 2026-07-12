@@ -37,8 +37,8 @@ python -m backend.pipeline --input ./burst --output result.png
 Optico 透過讀取檔案 header（JPEG SOI 標記 `0xFF 0xD8`）自動偵測輸入格式。JPEG 輸入時自動啟用下列優化：
 
 - **Phase 2 對齊：** ECC 高斯濾波核心從 5 → 7 px，壓制 8×8 DCT inter-block 邊界。
-- **Phase 8.0 數據端預加重：** 在 Drizzle 疊加投影前先對原始 LR 影格套用殘差高通濾波器（`alpha=0.55`），還原 JPEG 被量化丟失的高頻細節。
-- **Phase 9 反捲積：** 避開不穩定的空間噪訊-對比估計（JPEG 降噪會嚴重扭曲噪訊估算導致過度銳化），改為直接將 `psf_base` 定錨至鏡頭物理焦距：
+
+- **Phase 9 反捲積：** 避開不穩定的空間噪訊-對比估計（JPEG 降噪會嚴重扭曲噪訊估算導致過度銳化），改為由用戶在執行時透過參數手動將 `psf_base` 定錨至鏡頭物理焦距：
   - **焦距 <= 28mm (17mm 超廣角，小人臉)** $\to$ `--psf-base 0.35`（保護小人臉五官不扭曲）。
   - **焦距 = 45mm** $\to$ `--psf-base 0.57`。
   - **焦距 = 50mm (50mm 中長焦，人臉大)** $\to$ `--psf-base 0.63`（發揮最高解像力與銳度）。
