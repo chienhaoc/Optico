@@ -52,40 +52,22 @@ from .constants import (
     MIN_SCALE, MAX_SCALE, MIN_RETAINED_RATIO,
 )
 
-logger = logging.getLogger(__name__)
-
-
-def _adaptive_decay(cc_mean: float) -> float:
-    """Map mean ECC CC score to optical decay factor.
-
-    cc_mean <= OPTICAL_DECAY_CC_LOW  → OPTICAL_DECAY_CONSTANT (0.75)
-    cc_mean >= OPTICAL_DECAY_CC_HIGH → OPTICAL_DECAY_MAX (0.90)
-    Linearly interpolated in between.
-    """
-    if cc_mean <= OPTICAL_DECAY_CC_LOW:
-        return OPTICAL_DECAY_CONSTANT
-    t = (cc_mean - OPTICAL_DECAY_CC_LOW) / (OPTICAL_DECAY_CC_HIGH - OPTICAL_DECAY_CC_LOW)
-    t = float(np.clip(t, 0.0, 1.0))
-    decay = OPTICAL_DECAY_CONSTANT + t * (OPTICAL_DECAY_MAX - OPTICAL_DECAY_CONSTANT)
-    return float(np.clip(decay, OPTICAL_DECAY_CONSTANT, OPTICAL_DECAY_MAX))
-
+logger = logging.getLogger(__name__)# ============================================================
+# Pre-flight Scale Bounding (Phase 7)
+# ============================================================
 
 def calculate_safe_scale_cap(
     num_frames: int,
     retained_ratio: float,
     dither_neff: float = 1.0,
     optical_decay: float = OPTICAL_DECAY_CONSTANT,
-    cc_mean: float = 0.0,
 ) -> float:
     """Calculate the maximum safe upscale factor.
 
     Two independent physical limits:
 
     1. Density Limit: sqrt(num_frames * retained_ratio)
-    2. Blur Limit:    adaptive_decay(cc_mean) * sqrt(N_eff_kde)
-
-    When cc_mean > 0, adaptive_decay replaces the fixed optical_decay
-    argument for computing the blur limit.
+    2. Blur Limit:    optical_decay * sqrt(N_eff)
 
     Parameters
     ----------
@@ -94,9 +76,7 @@ def calculate_safe_scale_cap(
     dither_neff : float
         N_eff from calculate_dither_quality_neff() (KDE or histogram).
     optical_decay : float
-        Fallback decay factor (used when cc_mean=0).
-    cc_mean : float
-        Mean ECC CC score across valid frames (0 = unknown, use fallback).
+        Fixed decay factor (default 0.75).
 
     Returns
     -------
@@ -108,11 +88,7 @@ def calculate_safe_scale_cap(
     R = float(np.clip(retained_ratio, MIN_RETAINED_RATIO, 1.0 - MIN_RETAINED_RATIO))
     N_eff = max(dither_neff, 1.0)
 
-    # Choose decay source
-    if cc_mean > 0.0:
-        decay = _adaptive_decay(cc_mean)
-    else:
-        decay = float(optical_decay)
+    decay = float(optical_decay)
 
     density_limit = math.sqrt(num_frames * R)
     blur_limit = decay * math.sqrt(N_eff)
@@ -120,9 +96,9 @@ def calculate_safe_scale_cap(
     safe_cap = float(np.clip(min(density_limit, blur_limit), MIN_SCALE, MAX_SCALE))
 
     logger.info(
-        "Pre-flight: N=%d, R=%.3f, N_eff=%.3f, cc_mean=%.3f, decay=%.3f -> "
+        "Pre-flight: N=%d, R=%.3f, N_eff=%.3f, decay=%.3f -> "
         "density=%.3f, blur=%.3f -> cap=%.3f",
-        num_frames, R, N_eff, cc_mean, decay, density_limit, blur_limit, safe_cap,
+        num_frames, R, N_eff, decay, density_limit, blur_limit, safe_cap,
     )
     return safe_cap
 
@@ -144,8 +120,7 @@ def resolve_final_scale(
     retained_ratio : float
     dither_neff : float
     cc_scores : list of float, optional
-        Per-frame ECC CC scores.  Used both as retained_ratio fallback
-        and to compute cc_mean for adaptive decay.
+        Per-frame ECC CC scores. Used both as retained_ratio fallback.
     config : OpticoConfig, optional
 
     Returns
@@ -162,16 +137,14 @@ def resolve_final_scale(
         retained_ratio = float(np.mean(valid_cc))
         logger.info("Using mean CC (%.4f) as retained ratio proxy", retained_ratio)
 
-    cc_mean = float(np.mean(valid_cc)) if valid_cc else 0.0
-
     safe_cap = calculate_safe_scale_cap(
         num_frames, retained_ratio, dither_neff,
         optical_decay=config.optical_decay,
-        cc_mean=cc_mean,
     )
 
     final_scale = float(np.clip(min(target_scale, safe_cap), MIN_SCALE, MAX_SCALE))
 
+    cc_mean = float(np.mean(valid_cc)) if valid_cc else 0.0
     if final_scale < target_scale:
         logger.warning(
             "Target scale %.2f clamped to %.2f (safe_cap=%.2f, cc_mean=%.3f)",
@@ -182,5 +155,4 @@ def resolve_final_scale(
             "Target scale %.2f within safe bounds (cap=%.2f, cc_mean=%.3f)",
             target_scale, safe_cap, cc_mean,
         )
-
     return final_scale, safe_cap

@@ -71,9 +71,7 @@ The theoretical resolution limit is bounded by two physical constraints:
    $$S_{\text{density}} = \sqrt{N \cdot R_{\text{global}}}$$
 2. **Alignment Blur Limit (CRLB):** using $N_{\text{eff}}$ as the dither quality measure:
    $$S_{\text{blur}} = \alpha \cdot \sqrt{N_{\text{eff}}}$$
-   where $\alpha$ is the adaptive decay factor. Instead of a hard constant, $\alpha$ scales adaptively between `OPTICAL_DECAY_CONSTANT` (0.75) and `OPTICAL_DECAY_MAX` (0.90) based on alignment quality (`cc_mean`):
-$$\alpha_{\text{adaptive}} = \text{clip}\left(0.75 + \frac{\text{cc\_mean} - 0.85}{0.98 - 0.85} \times (0.90 - 0.75),\ 0.75,\ 0.90\right)$$
-This ensures that tighter alignment allows for higher upscale bounds.
+   where $\alpha = 0.75$ is the optical decay constant.
 
 The final scale factor is:
 $$S_{\text{final}} = \min(S_{\text{target}},\ S_{\text{density}},\ S_{\text{blur}})$$
