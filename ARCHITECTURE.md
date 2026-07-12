@@ -65,6 +65,7 @@ To protect against Alignment Drift Blur:
 * **Vectorized Warp**: Warps each frame and weight map onto the HR grid via `cv2.warpAffine` using scaling translations, achieving $O(N \cdot H \cdot W)$ vectorized efficiency.
 * **Active Memory Chunking**: Divides the HR canvas into horizontal strips. Each chunk is processed, normalized, and cast to float32 before the intermediate high-precision accumulators are deleted and `gc.collect()` is called to reclaim memory.
 * **Drizzle Cache Registry**: Computes an MD5 signature of the input frame bytes, resolved scale, and configurations. On cache hit, the pipeline skips Phases 2–8 entirely and loads the high-precision Drizzle stacked canvas directly from disk.
+* **LR Data-Side Pre-emphasis (Phase 8.0)**: On JPEG inputs, applies a high-pass residual filter ($\alpha = 0.55$) to the original LR images prior to warp. This boosts spatial frequency contrast on pixel-level edges, greatly reducing the deconvolution load and minimizing sharpening-induced ring halos.
 * **Kernel Selection**: `kernel_mode` (default **`lanczos4`**, changed 2026-07) selects the accumulation kernel. `lanczos4` combined with the grid-safe PSF cap beats `box` and `lanczos2` on ringing, grid-periodicity, and leave-one-out fidelity.
 
 ### 5. Dedicated Lens Deconvolution (`deconvolution.py`)

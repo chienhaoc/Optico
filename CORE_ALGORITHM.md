@@ -112,6 +112,14 @@ This is equivalent to bilinear interpolation from surrounding well-covered pixel
 - **`lanczos2_clamped`**: windowed sinc with negative sidelobe weights zeroed.
 - **`box`**: backward nearest-neighbor kernel, subject to grid ripples.
 
+### LR Data-Side Pre-emphasis (Phase 8.0)
+For JPEG inputs, compression quantizes away high-frequency DCT coefficients. To restore edge contrast prior to Drizzle stacking, Optico applies a pre-emphasis high-pass filter to each input LR frame:
+1. **Extract high frequencies:**
+   $$\text{hp}_i = I_{\text{LR}, i} - \text{GaussianBlur}(I_{\text{LR}, i},\ \text{kernel}=3\times3,\ \sigma=0.8)$$
+2. **Apply compensation:**
+   $$I_{\text{pre}, i} = \text{clip}(I_{\text{LR}, i} + \alpha \cdot \text{hp}_i,\ 0,\ 255)$$
+   where $\alpha = 0.55$ represents the pre-emphasis gain. This pre-enhancement increases spatial gradient gradients prior to stacking, which dramatically lowers the regularisation burden during Phase 9 deconvolution.
+
 ---
 
 ## 5. Frequency-Dependent Wiener Deconvolution (`deconvolution.py`)

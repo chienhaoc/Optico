@@ -37,6 +37,7 @@ python -m backend.pipeline --input ./burst --output result.png
 Optico auto-detects input format by reading file headers (JPEG SOI marker `0xFF 0xD8`). JPEG input activates automatic adjustments:
 
 - **Phase 2 alignment:** ECC Gaussian filter enlarged 5 → 7 px to suppress 8×8 DCT inter-block edges.
+- **Phase 8.0 Drizzle Pre-emphasis:** Applies a high-pass residual filter ($\alpha = 0.55$) to LR frames prior to stacking to restore quantized high-frequency details.
 
 - **Phase 9 deconvolution:** Bypasses unstable noise-contrast calculations on JPEG quantization floors by allowing users to manually map `psf_base` based on physical focal lengths:
   - **Focal Length <= 28mm (17mm wide-angle, small faces)** $\to$ `--psf-base 0.35` (to protect small facial details from over-sharpening).

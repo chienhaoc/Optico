@@ -94,6 +94,14 @@ $$r_{\text{drop}} = \frac{p \cdot S}{2}, \quad p = \text{pixfrac} \in [0,1]$$
 - **`lanczos2_clamped`**：windowed sinc，負向 sidelobe 權重歸零。
 - **`box`**：反向鄰域核心，容易在手持連拍中產生網格紋路。
 
+### LR 數據端預加重 (Phase 8.0)
+針對 JPEG 輸入影像，相機壓縮會將高頻 DCT 係數歸零。為了在 Drizzle 疊加之前還原邊緣對比度，Optico 對每個輸入的原始 LR 影格套用一個預加重高通濾波器：
+1. **提取高頻分量：**
+   $$\text{hp}_i = I_{\text{LR}, i} - \text{GaussianBlur}(I_{\text{LR}, i},\ \text{kernel}=3\times3,\ \sigma=0.8)$$
+2. **套用殘差補償：**
+   $$I_{\text{pre}, i} = \text{clip}(I_{\text{LR}, i} + \alpha \cdot \text{hp}_i,\ 0,\ 255)$$
+   其中 $\alpha = 0.55$ 為預加重增益。這個前向補償在疊加前拉高了像素級的局部梯度，能大幅減輕 Phase 9 反捲積時的正則化壓力，進而防止振鈴白邊的產生。
+
 
 
 分塊累加：
