@@ -81,6 +81,7 @@ from typing import Optional
 
 import cv2
 import numpy as np
+import math
 
 from .constants import (
     OpticoConfig,
@@ -113,6 +114,14 @@ from .cache import (
 )
 
 logger = logging.getLogger(__name__)
+
+def _estimate_noise_mad(img_gray: np.ndarray) -> float:
+    """Estimate noise standard deviation using Median Absolute Deviation (MAD)."""
+    lap = cv2.Laplacian(img_gray, cv2.CV_32F, ksize=1)
+    mad = np.median(np.abs(lap - np.median(lap)))
+    # Correct factor for 3x3 Laplacian filter noise magnification (sqrt(20))
+    sigma = float(1.4826 * mad / math.sqrt(20.0))
+    return max(sigma, 1e-6)
 
 OPTICO_VERSION = "1.1.0"  # bump when cache format or algorithm changes
 
@@ -676,16 +685,30 @@ def run_pipeline(
 
         # -- Drizzle Pre-emphasis (LR Data-Side Pre-filtering) --
         # Pre-emphasize high frequencies in LR space for JPEG inputs to compensate blur early.
+        # Spatially adaptive using a Sobel-derived edge mask to avoid magnifying flat-region noise.
         # This keeps deconv PSF safe at a unified 0.88, avoiding Ringing and Clamping loss.
         drizzle_images = images
         if config.jpeg_input:
-            logger.info("-- Drizzle Pre-emphasis: Applying LR high-pass pre-filter (alpha=0.55) --")
+            logger.info("-- Drizzle Pre-emphasis: Applying Spatially Adaptive LR high-pass pre-filter (alpha=0.55) --")
             drizzle_images = []
             for img in images:
                 img_f = img.astype(np.float32)
                 blur = cv2.GaussianBlur(img_f, (3, 3), 0.8)
                 hp = img_f - blur
-                emp = np.clip(img_f + 0.55 * hp, 0, 255).astype(np.uint8)
+                
+                # Compute local edge mask in LR space
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                sigma_noise = _estimate_noise_mad(gray)
+                sobelx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+                sobely = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+                grad_mag = np.sqrt(sobelx**2 + sobely**2)
+                threshold = max(3.5 * sigma_noise, 3.0)
+                edge_mask = np.clip((grad_mag - threshold) / threshold, 0.0, 1.0)
+                edge_mask_sm = cv2.GaussianBlur(edge_mask, (5, 5), 1.5)
+                edge_mask_3d = np.expand_dims(edge_mask_sm, axis=2)
+                
+                # Apply spatially adaptive pre-emphasis
+                emp = np.clip(img_f + 0.55 * edge_mask_3d * hp, 0, 255).astype(np.uint8)
                 drizzle_images.append(emp)
 
         # -- Phase 8: Drizzle Stacking --

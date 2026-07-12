@@ -110,13 +110,16 @@ This is equivalent to bilinear interpolation from surrounding well-covered pixel
 - **`lanczos2_clamped`**: windowed sinc with negative sidelobe weights zeroed.
 - **`box`**: backward nearest-neighbor kernel, subject to grid ripples.
 
-### LR Data-Side Pre-emphasis (Phase 8.0)
-For JPEG inputs, compression quantizes away high-frequency DCT coefficients. To restore edge contrast prior to Drizzle stacking, Optico applies a pre-emphasis high-pass filter to each input LR frame:
+### Spatially Adaptive LR Pre-emphasis (Phase 8.0)
+For JPEG inputs, compression quantizes away high-frequency DCT coefficients. To avoid amplifying noise in flat regions while restoring edge contrast, Optico applies a spatially adaptive pre-emphasis high-pass filter to each input LR frame:
 1. **Extract high frequencies:**
    $$\text{hp}_i = I_{\text{LR}, i} - \text{GaussianBlur}(I_{\text{LR}, i},\ \text{kernel}=3\times3,\ \sigma=0.8)$$
-2. **Apply compensation:**
-   $$I_{\text{pre}, i} = \text{clip}(I_{\text{LR}, i} + \alpha \cdot \text{hp}_i,\ 0,\ 255)$$
-   where $\alpha = 0.55$ represents the pre-emphasis gain. This pre-enhancement increases spatial gradient gradients prior to stacking, which dramatically lowers the regularisation burden during Phase 9 deconvolution.
+2. **Compute local edge mask in LR space:**
+   $$\text{edge\_mask}_i = \text{clip}\left(\frac{\text{grad\_mag}_i - T}{T},\ 0.0,\ 1.0\right)$$
+   where $T = \max(3.5 \sigma_{\text{noise}}, 3.0)$ and $\sigma_{\text{noise}}$ is estimated using MAD on the grayscale frame. The mask is smoothed with a Gaussian filter: $\text{edge\_mask\_sm}_i = \text{GaussianBlur}(\text{edge\_mask}_i, 5\times5)$.
+3. **Apply spatially adaptive compensation:**
+   $$I_{\text{pre}, i} = \text{clip}(I_{\text{LR}, i} + \alpha \cdot \text{edge\_mask\_sm}_i \cdot \text{hp}_i,\ 0,\ 255)$$
+   where $\alpha = 0.55$ represents the pre-emphasis gain. This prevents noise amplification in flat regions (where mask $\approx 0$) while successfully boosting high-frequency edge contrast (where mask $\approx 1$) prior to Drizzle stacking.
 
 ---
 
